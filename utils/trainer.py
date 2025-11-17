@@ -13,7 +13,6 @@ from torch.optim.lr_scheduler import _LRScheduler
 class Trainer:
     """
     一个全功能的训练/评估迭代器，封装了设备管理、状态跟踪、参数更新和检查点逻辑。
-
     通过迭代 Trainer 实例，可以简化训练和评估循环，并通过其属性访问当前状态
     (epoch, batch_idx, data, target等)，同时提供 update() 和 checkpointing 方法。
     """
@@ -139,16 +138,6 @@ class Trainer:
             )
         return self._create_eval_iterator(loader_to_use, description, tqdm_bar)
 
-    def update(self, loss: torch.Tensor) -> None:
-        """执行反向传播和优化器步骤。"""
-        if self.optimizer is None:
-            raise RuntimeError(
-                "Cannot call update() because no optimizer was provided to the Trainer."
-            )
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
     def step_scheduler(self, metric: Optional[float] = None) -> None:
         """
         更新学习率调度器。通常在每个 epoch 结束后调用。
@@ -175,19 +164,52 @@ class Trainer:
             self.scheduler.step(metric)
         else:
             self.scheduler.step()
+
+    def auto_step_scheduler(self, loss: Optional[torch.Tensor] = None, step_plateau_with_train_loss: bool = False) -> None:
+        """
+        在每个 epoch 结束时，有条件地自动更新学习率调度器。
+        此方法会检查当前是否为 epoch 的最后一个批次。如果是，则会根据调度器类型执行更新：
+        - 对于 `StepLR` 等，会自动调用 `step()`。
+        - 对于 `ReduceLROnPlateau`，默认不执行。
+        - 若要强制使用当前训练损失更新 `ReduceLROnPlateau`，需将 `step_plateau_with_train_loss` 设为 True，
+          此时必须提供 `loss` 参数。
+        Args:
+            loss (Optional[torch.Tensor]): 当前批次的损失张量。对于 ReduceLROnPlateau 是必需的。
+            step_plateau_with_train_loss (bool): 是否强制更新 `ReduceLROnPlateau`。
+        """
+        if self.is_last_batch_in_epoch and self.scheduler is not None:
+            is_plateau_scheduler = isinstance(self.scheduler, ReduceLROnPlateau)
+            # 1. 如果不是 Plateau 调度器，则总是更新。
+            # 2. 如果是 Plateau 调度器，则仅在用户显式要求时才更新。
+            if not is_plateau_scheduler or step_plateau_with_train_loss:
+                self.step_scheduler(loss.item())
+
+    def update(self, loss: torch.Tensor, step_plateau_with_train_loss: bool = False) -> None:
+        """
+        执行反向传播和优化器步骤，并在 epoch 结束时自动更新调度器。
+        Args:
+            loss (torch.Tensor): 要反向传播的损失张量。
+            step_plateau_with_train_loss (bool): 是否强制使用此 `loss` 更新 `ReduceLROnPlateau`。
+        """
+        if self.optimizer is None:
+            raise RuntimeError(
+                "Cannot call update() because no optimizer was provided to the Trainer."
+            )
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        # 调用专用的自动调度器步进方法
+        self.auto_step_scheduler(loss, step_plateau_with_train_loss=step_plateau_with_train_loss)
     
     def auto_update(self, step_plateau_with_train_loss: bool = False) -> torch.Tensor:
         """
         执行自动化的前向传播、损失计算和参数更新，并返回损失值。
-        此方法在每个 epoch 结束时会自动更新学习率调度器，但有特殊规则：
-        - 对于 `StepLR`, `CosineAnnealingLR` 等常规调度器，会自动调用 `step()`。
-        - 对于 `ReduceLROnPlateau`，默认不会自动更新，因为最佳实践是使用验证集指标。
-        - 如果希望强制使用最后一个批次的训练损失来更新 `ReduceLROnPlateau`，
-          请调用 `auto_update(step_plateau_with_train_loss=True)`。
-        
+        此方法在每个 epoch 结束时会调用 `auto_step_scheduler` 来自动更新学习率调度器。
         Args:
-            step_plateau_with_train_loss (bool): 如果为 True，即使调度器是
-                `ReduceLROnPlateau`，也会使用当前训练损失来更新它。默认为 False。
+            step_plateau_with_train_loss (bool): 传递给 `auto_step_scheduler`，
+                若为 True，则强制使用训练损失更新 `ReduceLROnPlateau`。默认为 False。
+
         Returns:
             torch.Tensor: 计算出的损失张量。
         
@@ -206,13 +228,8 @@ class Trainer:
         loss = self.criterion(logits, self.target)
         # 反向传播和优化
         self.update(loss)
-        # 在 epoch 结束时，有条件地更新学习率调度器
-        if self.is_last_batch_in_epoch and self.scheduler is not None:
-            is_plateau_scheduler = isinstance(self.scheduler, ReduceLROnPlateau)
-            # 1. 如果不是 Plateau 调度器，则总是更新。
-            # 2. 如果是 Plateau 调度器，则仅在用户显式要求时才更新。
-            if not is_plateau_scheduler or step_plateau_with_train_loss:
-                self.step_scheduler(loss.item())
+        # 调用专用的自动调度器步进方法
+        self.auto_step_scheduler(loss, step_plateau_with_train_loss=step_plateau_with_train_loss)
         return loss
 
     def save_checkpoint(self, path: Optional[str] = None, extra_info: Optional[Dict[str, Any]] = None) -> None:
