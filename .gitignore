@@ -124,3 +124,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Checkpoint files
+
+.checkpoint
+checkpoint/
