@@ -1,13 +1,14 @@
-# trainer.py
-
 import os
 import torch
 import torch.nn as nn
 
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from typing import Any, Generator, Iterator, Optional, Dict
 from tqdm import tqdm
+
+from torch.optim.lr_scheduler import _LRScheduler
 
 class Trainer:
     """
@@ -23,6 +24,8 @@ class Trainer:
         train_loader: Optional[DataLoader] = None,
         test_loader: Optional[DataLoader] = None,
         optimizer: Optional[Optimizer] = None,
+        criterion: Optional[nn.Module] = None,
+        scheduler: Optional[_LRScheduler] = None,
         checkpoint_path: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -35,6 +38,8 @@ class Trainer:
             train_loader (Optional[DataLoader]): 默认的训练数据加载器。
             test_loader (Optional[DataLoader]): 默认的测试/评估数据加载器。
             optimizer (Optional[Optimizer]): 优化器实例。如果提供，可使用 trainer.update()。
+            criterion (Optional[nn.Module]): 损失函数。如果与 optimizer 一同提供，可使用 trainer.auto_update()。
+            scheduler (Optional[_LRScheduler]): 学习率调度器。如果提供，可通过 trainer.step_scheduler() 更新。
             checkpoint_path (Optional[str]): 默认的检查点文件路径。
             device (Optional[torch.device]): 计算设备。默认为自动检测CUDA。
         """
@@ -43,8 +48,10 @@ class Trainer:
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.optimizer = optimizer
+        self.criterion = criterion
+        self.scheduler = scheduler
         self.checkpoint_path = checkpoint_path
-        
+
         # --- 设备管理 (Device Management) ---
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,6 +149,58 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
 
+    def step_scheduler(self, metric: Optional[float] = None) -> None:
+        """
+        更新学习率调度器。通常在每个 epoch 结束后调用。
+        如果调度器是 ReduceLROnPlateau，则需要提供 metric 参数。
+        如果调度器是其他类型（如 StepLR、CosineAnnealingLR 等），则不需要提供 metric 参数。
+
+        Args:
+            metric (Optional[float]): 用于 ReduceLROnPlateau 的指标值。
+
+        Raises:
+            ValueError: 如果调度器是 ReduceLROnPlateau 但没有提供 metric。
+            RuntimeError: 如果没有在 Trainer 中配置调度器。
+        """
+        if self.scheduler is None:
+            # 如果没有调度器，静默返回或打印警告
+            # print("Warning: step_scheduler() called but no scheduler is configured.")
+            return
+
+        if isinstance(self.scheduler, ReduceLROnPlateau):
+            if metric is None:
+                raise ValueError(
+                    "A metric (e.g., validation loss) must be provided for ReduceLROnPlateau scheduler."
+                )
+            self.scheduler.step(metric)
+        else:
+            self.scheduler.step()
+    
+    def auto_update(self) -> torch.Tensor:
+        """
+        执行自动化的前向传播、损失计算和参数更新，并返回损失值。
+        这是一个便捷方法，它要求 Trainer 在初始化时同时提供了 optimizer 和 criterion。
+
+        Returns:
+            torch.Tensor: 计算出的损失张量。
+        
+        Raises:
+            RuntimeError: 如果 `optimizer` 或 `criterion` 未在初始化时提供。
+        """
+        if self.optimizer is None or self.criterion is None:
+            raise RuntimeError(
+                "Cannot call auto_update() because either the optimizer or the "
+                "criterion was not provided to the Trainer."
+            )
+        
+        # 前向传播
+        logits = self.model(self.data)
+        # 计算损失
+        loss = self.criterion(logits, self.target)
+        # 反向传播和优化
+        self.update(loss)
+        return loss
+
     def save_checkpoint(self, path: Optional[str] = None, extra_info: Optional[Dict[str, Any]] = None) -> None:
         """
         保存训练检查点。
@@ -163,6 +222,7 @@ class Trainer:
             'epoch': self.epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
         }
         if extra_info:
             checkpoint.update(extra_info)
@@ -192,6 +252,9 @@ class Trainer:
             
             if self.optimizer and 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            if self.scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
             self.start_epoch = checkpoint.get('epoch', -1) + 1
             print(f"Checkpoint loaded from '{path_to_use}'. Resuming training from epoch {self.start_epoch}.")
