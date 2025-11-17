@@ -86,11 +86,11 @@ num_epochs = 10
 from utils.trainer import Trainer
 
 model_trainer = Trainer(model, num_epochs, train_loader, optimizer)
-start_epoch = model_trainer.load_checkpoint('./checkpoints/linear_mnist_model.pth')
+start_epoch = model_trainer.load_checkpoint('./checkpoints/linear_mnist_model.pth').display_epoch
 
 print(f'Starting epoch: {start_epoch}')
 
-for trainer in model_trainer:
+for trainer in model_trainer.train():
     logits = model(trainer.data)
     loss = criterion(logits, trainer.target)
     trainer.update(loss)
