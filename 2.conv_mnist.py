@@ -64,7 +64,7 @@ print(model)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-model_trainer = Trainer(model, 10, train_loader, optimizer)
+model_trainer = Trainer(model, 10, train_loader, optimizer=optimizer)
 start_epoch = model_trainer.load_checkpoint('./checkpoints/conv_mnist_model.pth').display_epoch
 
 for trainer in model_trainer.train():

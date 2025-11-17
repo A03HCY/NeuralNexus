@@ -85,7 +85,7 @@ num_epochs = 10
 
 from utils.trainer import Trainer
 
-model_trainer = Trainer(model, num_epochs, train_loader, optimizer)
+model_trainer = Trainer(model, num_epochs, train_loader, optimizer=optimizer)
 start_epoch = model_trainer.load_checkpoint('./checkpoints/linear_mnist_model.pth').display_epoch
 
 print(f'Starting epoch: {start_epoch}')
@@ -112,4 +112,4 @@ with torch.no_grad():
 accuracy = 100 * correct / total
 print(f'Test Accuracy: {accuracy:.2f}%')
 
-torch.save(model.state_dict(), './models/linear_mnist_model.pth')
+model_trainer.save_model('./models/linear_mnist_model.pth')

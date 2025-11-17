@@ -201,3 +201,19 @@ class Trainer:
             self.start_epoch = 0
         
         return self
+    
+    def save_model(self, path: str) -> None:
+        """
+        保存训练模型。
+        """
+        torch.save(self.model.state_dict(), path)
+    
+    def load_model(self, path: str) -> None:
+        """
+        加载训练模型。
+        """
+        try:
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
+            print(f"Model loaded from '{path}'.")
+        except Exception as e:
+            print(f"Warning: Failed to load model from {path}. Error: {e}")
