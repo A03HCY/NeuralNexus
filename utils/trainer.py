@@ -38,8 +38,8 @@ class Trainer:
             test_loader (Optional[DataLoader]): 默认的测试/评估数据加载器。
             optimizer (Optional[Optimizer]): 优化器实例。如果提供，可使用 trainer.update()。
             criterion (Optional[nn.Module]): 损失函数。如果与 optimizer 一同提供，可使用 trainer.auto_update()。
-            scheduler (Optional[_LRScheduler]): 学习率调度器。如果提供，可通过 trainer.step_scheduler() 更新。
-            checkpoint_path (Optional[str]): 默认的检查点文件路径。
+            scheduler (Optional[_LRScheduler]): 学习率调度器。如果提供，可通过 trainer.auto_step_scheduler() 更新。
+            checkpoint_path (Optional[str]): 默认的检查点文件路径。如果提供，初始化时会自动加载检查点。
             device (Optional[torch.device]): 计算设备。默认为自动检测CUDA。
         """
         self.model = model
@@ -68,6 +68,9 @@ class Trainer:
         self.is_last_batch_in_epoch: bool = False
         self.start_epoch: int = 0
 
+        if self.checkpoint_path is not None:
+            self.load_checkpoint()
+
     @property
     def display_epoch(self) -> int:
         """返回从 1 开始计数的、用于向用户展示的当前 epoch 编号。"""
@@ -84,8 +87,19 @@ class Trainer:
             
             for batch_idx, batch_data in enumerate(data_loader):
                 self.batch_idx = batch_idx
-                self.data = batch_data[0].to(self.device)
-                self.target = batch_data[1].to(self.device)
+                # 将除了最后一个元素之外的所有内容都视为 data
+                # 将最后一个元素视为 target
+                if isinstance(batch_data, (list, tuple)) and len(batch_data) > 1:
+                    # 将数据和目标移动到设备
+                    self.data = tuple(d.to(self.device) for d in batch_data[:-1])
+                    self.target = batch_data[-1].to(self.device)
+                    # 如果只有一个数据元素，则不使用元组
+                    if len(self.data) == 1:
+                        self.data = self.data[0]
+                else: # 兼容原始的 (data, target) 格式
+                    self.data = batch_data[0].to(self.device)
+                    self.target = batch_data[1].to(self.device)
+                
                 self.is_last_batch_in_epoch = (batch_idx == num_batches - 1)
                 
                 yield self
@@ -113,8 +127,14 @@ class Trainer:
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(iterable):
                     self.batch_idx = batch_idx
-                    self.data = batch_data[0].to(self.device)
-                    self.target = batch_data[1].to(self.device)
+                    if isinstance(batch_data, (list, tuple)) and len(batch_data) > 1:
+                        self.data = tuple(d.to(self.device) for d in batch_data[:-1])
+                        self.target = batch_data[-1].to(self.device)
+                        if len(self.data) == 1:
+                            self.data = self.data[0]
+                    else:
+                        self.data = batch_data[0].to(self.device)
+                        self.target = batch_data[1].to(self.device)
                     yield self
         finally:
             self.model.train()
@@ -140,7 +160,7 @@ class Trainer:
 
     def step_scheduler(self, metric: Optional[float] = None) -> None:
         """
-        更新学习率调度器。通常在每个 epoch 结束后调用。
+        更新学习率调度器。
         如果调度器是 ReduceLROnPlateau，则需要提供 metric 参数。
         如果调度器是其他类型（如 StepLR、CosineAnnealingLR 等），则不需要提供 metric 参数。
 
@@ -223,7 +243,10 @@ class Trainer:
             )
         
         # 前向传播
-        logits = self.model(self.data)
+        if isinstance(self.data, tuple):
+            logits = self.model(*self.data)
+        else:
+            logits = self.model(self.data)
         # 计算损失
         loss = self.criterion(logits, self.target)
         # 反向传播和优化
