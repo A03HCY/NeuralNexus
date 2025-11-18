@@ -82,11 +82,9 @@ model_trainer = Trainer(
     checkpoint_path='checkpoints/lstm_class_model.pth'
 )
 
-for trainer in model_trainer.train():
-    loss = trainer.auto_update()
-    if trainer.is_last_batch_in_epoch:
-        print(f'Epoch: {trainer.display_epoch}, Loss: {loss.item():.6f}')
-        trainer.save_checkpoint()
+for trainer in model_trainer.train(tqdm_bar=True, print_loss=True):
+    trainer.auto_update()
+    trainer.auto_checkpoint()
 
 correct = 0
 total = 0

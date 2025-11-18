@@ -57,7 +57,6 @@ class Trainer:
         else:
             self.device = device
         
-        print(f"Trainer initialized. Using device: {self.device}")
         self.model.to(self.device)
 
         # --- 状态变量 (State Variables) ---
@@ -65,8 +64,15 @@ class Trainer:
         self.batch_idx: int = 0
         self.data: Optional[Any] = None
         self.target: Optional[Any] = None
+        self.is_first_batch_in_epoch: bool = False
         self.is_last_batch_in_epoch: bool = False
         self.start_epoch: int = 0
+        self.loss: Optional[torch.Tensor] = None
+
+        # --- 额外数据 (Extra Data) ---
+        self.total_params = sum(p.numel() for p in self.model.parameters())
+        self.trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self._display_model_summary()
 
         if self.checkpoint_path is not None:
             self.load_checkpoint()
@@ -76,17 +82,34 @@ class Trainer:
         """返回从 1 开始计数的、用于向用户展示的当前 epoch 编号。"""
         epoch = max(self.epoch, self.start_epoch)
         return epoch + 1
+    
+    def _display_model_summary(self):
+        """打印模型的参数摘要。"""
+        print("-"*50)
+        print(f"Model: {self.model.__class__.__name__}")
+        print(f"Using Device: {self.device}")
+        print(f"Total Parameters: {self.total_params / 1e6:.2f}M ({self.total_params:,})")
+        print(f"Trainable Parameters: {self.trainable_params / 1e6:.2f}M ({self.trainable_params:,})")
+        print("-"*50)
 
-    def _create_train_iterator(self, data_loader: DataLoader) -> Generator['Trainer', None, None]:
+    def _create_train_iterator(self, data_loader: DataLoader, tqdm_bar: bool, print_loss: bool) -> Generator['Trainer', None, None]:
         """内部生成器，为 train() 方法实现核心的循环逻辑。"""
         self.model.train()
         num_batches = len(data_loader)
         
         for epoch_num in range(self.start_epoch, self.num_epochs):
             self.epoch = epoch_num
-            
-            for batch_idx, batch_data in enumerate(data_loader):
+
+            # 根据 tqdm_bar 参数决定是否封装 data_loader
+            iterable = tqdm(
+                data_loader, 
+                desc=f"Epoch {self.display_epoch}/{self.num_epochs}", 
+                leave=True
+            ) if tqdm_bar else data_loader
+
+            for batch_idx, batch_data in enumerate(iterable):
                 self.batch_idx = batch_idx
+                
                 # 将除了最后一个元素之外的所有内容都视为 data
                 # 将最后一个元素视为 target
                 if isinstance(batch_data, (list, tuple)) and len(batch_data) > 1:
@@ -100,16 +123,29 @@ class Trainer:
                     self.data = batch_data[0].to(self.device)
                     self.target = batch_data[1].to(self.device)
                 
+                self.is_first_batch_in_epoch = (batch_idx == 0)
                 self.is_last_batch_in_epoch = (batch_idx == num_batches - 1)
                 
                 yield self
+            
+            if print_loss and self.loss is not None:
+                print(f"Epoch {self.display_epoch}/{self.num_epochs}: Loss = {self.loss.item()}")
 
-    def train(self, train_loader: Optional[DataLoader] = None) -> Iterator['Trainer']:
+    def train(self, train_loader: Optional[DataLoader] = None, tqdm_bar: bool = False, print_loss: bool = False) -> Iterator['Trainer']:
         """
         创建一个用于训练的迭代器。
 
-        可以在运行时传入一个 train_loader 临时使用，否则会使用初始化时提供的
-        默认 train_loader。如果两者都未提供，则会报错。
+        Args:
+            train_loader (Optional[DataLoader]): 临时使用的训练数据加载器，
+                若不提供则使用初始化时的默认加载器。
+            tqdm_bar (bool): 是否为每个 epoch 显示一个 tqdm 进度条。默认为 False。
+            print_loss (bool): 是否在每个 epoch 结束时打印损失。默认为 False。
+
+        Returns:
+            Iterator['Trainer']: 一个可迭代的 Trainer 实例。
+
+        Raises:
+            ValueError: 如果没有可用的 train_loader。
         """
         loader_to_use = train_loader if train_loader is not None else self.train_loader
         if loader_to_use is None:
@@ -117,7 +153,7 @@ class Trainer:
                 "No train_loader available. Please provide one to the train() method "
                 "or during Trainer initialization."
             )
-        return self._create_train_iterator(loader_to_use)
+        return self._create_train_iterator(loader_to_use, tqdm_bar, print_loss)
     
     def _create_eval_iterator(self, data_loader: DataLoader, description: str, tqdm_bar: bool) -> Generator['Trainer', None, None]:
         """内部生成器，为 eval() 方法实现核心的循环逻辑。"""
@@ -127,6 +163,8 @@ class Trainer:
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(iterable):
                     self.batch_idx = batch_idx
+                    self.is_first_batch_in_epoch = (batch_idx == 0)
+                    
                     if isinstance(batch_data, (list, tuple)) and len(batch_data) > 1:
                         self.data = tuple(d.to(self.device) for d in batch_data[:-1])
                         self.target = batch_data[-1].to(self.device)
@@ -202,7 +240,8 @@ class Trainer:
             # 1. 如果不是 Plateau 调度器，则总是更新。
             # 2. 如果是 Plateau 调度器，则仅在用户显式要求时才更新。
             if not is_plateau_scheduler or step_plateau_with_train_loss:
-                self.step_scheduler(loss.item())
+                metric = loss.item() if loss is not None else None
+                self.step_scheduler(metric)
 
     def update(self, loss: torch.Tensor, step_plateau_with_train_loss: bool = False) -> None:
         """
@@ -249,11 +288,17 @@ class Trainer:
             logits = self.model(self.data)
         # 计算损失
         loss = self.criterion(logits, self.target)
+        self.loss = loss
         # 反向传播和优化
-        self.update(loss)
-        # 调用专用的自动调度器步进方法
-        self.auto_step_scheduler(loss, step_plateau_with_train_loss=step_plateau_with_train_loss)
+        self.update(loss, step_plateau_with_train_loss=step_plateau_with_train_loss)
         return loss
+        
+    def auto_checkpoint(self) -> None:
+        """
+        在每个 epoch 的最后一个批次时保存检查点。
+        """
+        if self.is_last_batch_in_epoch:
+            self.save_checkpoint()
 
     def save_checkpoint(self, path: Optional[str] = None, extra_info: Optional[Dict[str, Any]] = None) -> None:
         """
