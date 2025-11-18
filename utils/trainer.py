@@ -68,11 +68,15 @@ class Trainer:
         self.is_last_batch_in_epoch: bool = False
         self.start_epoch: int = 0
         self.loss: Optional[torch.Tensor] = None
+        self.eval_loss: Optional[torch.Tensor] = None
 
         # --- 额外数据 (Extra Data) ---
         self.total_params = sum(p.numel() for p in self.model.parameters())
         self.trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self._display_model_summary()
+
+        self.correct_predictions = 0
+        self.total_predictions = 0
 
         if self.checkpoint_path is not None:
             self.load_checkpoint()
@@ -82,6 +86,13 @@ class Trainer:
         """返回从 1 开始计数的、用于向用户展示的当前 epoch 编号。"""
         epoch = max(self.epoch, self.start_epoch)
         return epoch + 1
+    
+    @property
+    def accuracy(self) -> float:
+        """返回当前的准确率。"""
+        if self.total_predictions == 0:
+            return 0.0
+        return self.correct_predictions / self.total_predictions
     
     def _display_model_summary(self):
         """打印模型的参数摘要。"""
@@ -194,6 +205,8 @@ class Trainer:
                 "No test_loader available. Please provide one to the eval() method "
                 "or during Trainer initialization."
             )
+        self.total_predictions = 0
+        self.correct_predictions = 0
         return self._create_eval_iterator(loader_to_use, description, tqdm_bar)
 
     def step_scheduler(self, metric: Optional[float] = None) -> None:
@@ -292,13 +305,30 @@ class Trainer:
         # 反向传播和优化
         self.update(loss, step_plateau_with_train_loss=step_plateau_with_train_loss)
         return loss
+    
+    def test_classify(self):
+        logist = self.model(self.data)
+        self.eval_loss = self.criterion(logist, self.target) if self.criterion else None
+        _, pred = logist.max(1)
+        if len(self.target.shape) == 1:
+            self.total_predictions += self.target.size(0)
+            self.correct_predictions += (pred == self.target).sum().item()
+        else:
+            _, cor = self.target.max(1)
+            self.total_predictions += self.target.size(0)
+            self.correct_predictions += (pred == cor).sum().item()
         
     def auto_checkpoint(self) -> None:
         """
         在每个 epoch 的最后一个批次时保存检查点。
         """
-        if self.is_last_batch_in_epoch:
-            self.save_checkpoint()
+        if not self.is_last_batch_in_epoch:
+            return
+        
+        if not self.checkpoint_path:
+            return
+        
+        self.save_checkpoint()
 
     def save_checkpoint(self, path: Optional[str] = None, extra_info: Optional[Dict[str, Any]] = None) -> None:
         """
