@@ -10,6 +10,33 @@ from tqdm import tqdm
 
 from torch.optim.lr_scheduler import _LRScheduler
 
+def match_shape_if_needed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    检查张量a的shape是否为[1, x]，张量b的shape是否为[x]。
+    如果是，并且它们的'x'维度匹配，则将a的shape调整为与b相同。
+    否则，保持a不变。
+    Args:
+        a (torch.Tensor): 可能需要调整shape的张量。
+        b (torch.Tensor): 作为参考shape的目标张量。
+    Returns:
+        torch.Tensor: 调整后（或未调整）的张量a。
+    """
+    # 步骤1: 获取两个张量的维度(ndim)和形状(shape)
+    a_ndim, a_shape = a.dim(), a.shape
+    b_ndim, b_shape = b.dim(), b.shape
+    # 步骤2: 检查是否完全满足 [1, x] vs [x] 的条件
+    # a 必须是2维, b 必须是1维
+    # a 的第0维必须是1
+    # a 的第1维必须等于b的第0维
+    if (a_ndim == 2 and b_ndim == 1 and 
+        a_shape[0] == 1 and a_shape[1] == b_shape[0]):
+        
+        # 使用 squeeze(0) 移除第0个维度，这是最推荐的方法
+        return a.squeeze(0)
+    
+    # 如果不满足上述所有条件，则不进行任何操作，直接返回原始的a
+    return a
+
 class Trainer:
     """
     一个全功能的训练/评估迭代器，封装了设备管理、状态跟踪、参数更新和检查点逻辑。
@@ -69,6 +96,7 @@ class Trainer:
         self.start_epoch: int = 0
         self.loss: Optional[torch.Tensor] = None
         self.eval_loss: Optional[torch.Tensor] = None
+        self.total_loss: Optional[torch.Tensor] = None
 
         # --- 额外数据 (Extra Data) ---
         self.total_params = sum(p.numel() for p in self.model.parameters())
@@ -94,6 +122,12 @@ class Trainer:
             return 0.0
         return self.correct_predictions / self.total_predictions
     
+    @property
+    def mean_loss(self) -> float:
+        if self.total_loss is None or self.total_predictions == 0:
+            return 0.0
+        return self.total_loss.item() / self.total_predictions
+    
     def _display_model_summary(self):
         """打印模型的参数摘要。"""
         print("-"*50)
@@ -115,7 +149,7 @@ class Trainer:
             iterable = tqdm(
                 data_loader, 
                 desc=f"Epoch {self.display_epoch}/{self.num_epochs}", 
-                leave=True
+                leave=False
             ) if tqdm_bar else data_loader
 
             for batch_idx, batch_data in enumerate(iterable):
@@ -207,6 +241,9 @@ class Trainer:
             )
         self.total_predictions = 0
         self.correct_predictions = 0
+        self.eval_loss = 0.0
+        self.total_loss = 0.0
+        self.loss = 0.0
         return self._create_eval_iterator(loader_to_use, description, tqdm_bar)
 
     def step_scheduler(self, metric: Optional[float] = None) -> None:
@@ -308,15 +345,23 @@ class Trainer:
     
     def test_classify(self):
         logist = self.model(self.data)
+        logist = match_shape_if_needed(logist, self.target)
         self.eval_loss = self.criterion(logist, self.target) if self.criterion else None
+        self.total_loss += self.eval_loss
+        self.total_predictions += self.target.size(0)
         _, pred = logist.max(1)
         if len(self.target.shape) == 1:
-            self.total_predictions += self.target.size(0)
             self.correct_predictions += (pred == self.target).sum().item()
         else:
             _, cor = self.target.max(1)
-            self.total_predictions += self.target.size(0)
             self.correct_predictions += (pred == cor).sum().item()
+    
+    def test_regress(self):
+        logist = self.model(self.data)
+        logist = match_shape_if_needed(logist, self.target)
+        self.eval_loss = self.criterion(logist, self.target) if self.criterion else None
+        self.total_loss += self.eval_loss
+        self.total_predictions += self.target.size(0)
         
     def auto_checkpoint(self) -> None:
         """

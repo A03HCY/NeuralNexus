@@ -86,15 +86,9 @@ for trainer in model_trainer.train(tqdm_bar=True, print_loss=True):
     trainer.auto_update()
     trainer.auto_checkpoint()
 
-correct = 0
-total = 0
 for trainer in model_trainer.eval(dataloader, tqdm_bar=True):
-    logist = model.forward(trainer.data)
-    _, predicted = torch.max(logist.data, 1)
-    _, cor = torch.max(trainer.target.data, 1)
-    total += trainer.target.size(0)
-    correct += (predicted == cor).sum().item()
+    trainer.test_classify()
 
-print(f'Accuracy: {100 * correct / total:.2f}%')
+print(f'Accuracy: {100 * model_trainer.accuracy:.2f}%')
 
 model_trainer.save_model('models/lstm_class_model.pth')
