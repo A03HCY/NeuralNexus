@@ -57,13 +57,6 @@ model = LinearNet()
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-model_trainer = Trainer(model, 1, criterion=criterion, optimizer=optimizer, checkpoint_path='./models/linear_mnist_model.pth')
+model_trainer = Trainer(model, 1, criterion=criterion, optimizer=optimizer, checkpoint_path='./checkpoints/linear_mnist_model.pth')
 
-for trainer in model_trainer.train(train_loader, tqdm_bar=True, print_loss=True):
-    trainer.auto_update()
-    trainer.auto_checkpoint()
-
-for trainer in model_trainer.eval(test_loader, tqdm_bar=True):
-    trainer.calculate_classification_metrics()
-
-print(f'Accuracy: {100 * model_trainer.eval_accuracy:.2f}%')
+model_trainer.fit(train_loader, train_loader, cal_classification_metrics=True)

@@ -311,12 +311,16 @@ class Trainer:
         
         print("=" * 80)
 
-    def init_tensorboard(self, log_dir: str = "runs"):
+    def init_tensorboard(self, log_dir: str = "runs") -> 'Trainer':
         """
         初始化 TensorBoard SummaryWriter。
+        如果 torch.utils.tensorboard 未安装，则不做任何操作。
 
         Args:
             log_dir (str): 日志保存目录。
+        
+        Returns:
+            self (Trainer): 返回当前 Trainer 对象，以便链式调用。
         """
         try:
             from torch.utils.tensorboard import SummaryWriter
@@ -324,6 +328,8 @@ class Trainer:
             print(f"TensorBoard initialized. Logs will be saved to: {log_dir}")
         except ImportError:
             print("Warning: TensorBoard not found. Install it using 'pip install tensorboard'.")
+        finally:
+            return self
 
     def log(self, metrics: Dict[str, float], step: Optional[int] = None):
         """
@@ -454,7 +460,7 @@ class Trainer:
         使用方法:
             for trainer in trainer.train():
                 loss = trainer.auto_update()
-                # 或者自定义 update 逻辑
+                或者自定义 update 逻辑
 
         Args:
             train_loader (DataLoader, optional): 覆盖初始化的 DataLoader。
@@ -768,6 +774,39 @@ class Trainer:
             best_path = os.path.join(os.path.dirname(self.checkpoint_path), 'best_model.pt')
             self.save_checkpoint(path=best_path, extra_info=metrics)
             print(f" -> New best model saved at epoch {self.display_epoch} ({monitor}: {metrics[monitor]:.4f})")
+    
+    def fit(
+            self,
+            train_loader: Optional[DataLoader] = None,
+            test_loader: Optional[DataLoader] = None,
+            cal_classification_metrics: bool = False,
+        ) -> 'Trainer':
+        """
+        傻瓜式训练器。
+        支持自动更新、自动保存检查点、自动计算分类指标。
+        
+        Args:
+            train_loader (Optional[DataLoader]): 训练数据加载器。
+            test_loader (Optional[DataLoader]): 测试数据加载器。
+            cal_classification_metrics (bool): 是否计算分类指标。
+            
+        Returns:
+            self (Trainer): 训练器对象，用于链式调用。
+        """
+        if not self.model:
+            raise RuntimeError("Model missing.")
+        if not self.optimizer or not self.criterion:
+            raise RuntimeError("Optimizer or Criterion missing.")
+        for trainer in self.train(train_loader, tqdm_bar=True, print_loss=True):
+            trainer.auto_update()
+            trainer.auto_checkpoint()
+        
+        if cal_classification_metrics:
+            for trainer in self.eval(test_loader, tqdm_bar=True):
+                trainer.calculate_classification_metrics()
+            print(f'Accuracy: {100 * self.eval_accuracy:.2f}%')
+        
+        return self
 
     def save_checkpoint(self, path: Optional[str] = None, extra_info: Optional[Dict[str, Any]] = None) -> None:
         path_to_use = path if path is not None else self.checkpoint_path
