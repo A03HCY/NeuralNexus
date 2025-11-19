@@ -284,7 +284,7 @@ class Trainer:
             raise RuntimeError("Optimizer or Criterion missing.")
         
         # 前向传播 (With AMP context support)
-        with autocast(enabled=self.use_amp):
+        with autocast(device_type=self.device.type, enabled=self.use_amp):
             if isinstance(self.data, tuple):
                 logits = self.model(*self.data)
             else:
