@@ -1,4 +1,5 @@
 import os
+import copy
 import random
 import numpy as np
 import torch
@@ -7,12 +8,15 @@ from torch.amp import GradScaler, autocast
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 from torch.utils.data import DataLoader
-from typing import Any, Generator, Iterator, Optional, Dict, List
+from typing import Any, Generator, Iterator, Optional, Dict, List, Union, Tuple
 from tqdm import tqdm
 
 def set_seed(seed: int = 42):
     """
     固定随机种子以保证实验的可复现性。
+    
+    包括 random, numpy, torch 以及 cuda 的种子设置。
+    注意：设置 cudnn.deterministic = True 可能会降低训练速度。
 
     Args:
         seed (int): 随机种子数值。
@@ -21,14 +25,16 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 确保 CUDA 选择确定性算法 (可能会降低性能)
+    # 确保 CUDA 选择确定性算法
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print(f"Random seed set to {seed}")
 
 def match_shape_if_needed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
-    检查张量 a 是否需要调整形状以匹配 b（主要用于处理 [1, N] vs [N] 的情况）。
+    检查张量 a 是否需要调整形状以匹配 b。
+    
+    常用于处理 Binary Cross Entropy 中预测值 [N, 1] 与 目标值 [N] 不匹配的情况。
 
     Args:
         a (torch.Tensor): 预测张量或源张量。
@@ -43,18 +49,57 @@ def match_shape_if_needed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
          return a.squeeze(1)
     return a
 
+class ModelEMA:
+    """
+    模型权重的指数移动平均 (Exponential Moving Average)。
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        # 创建影子模型 (Shadow Model)，只保存权重，不参与反向传播
+        self.shadow = copy.deepcopy(model.module if hasattr(model, 'module') else model)
+        self.shadow.eval()
+        # 将参数设为不需要梯度，节省显存
+        for param in self.shadow.parameters():
+            param.requires_grad = False
+    def update(self, model: nn.Module):
+        """根据当前模型参数更新影子参数"""
+        # 兼容 DataParallel
+        model_to_use = model.module if hasattr(model, 'module') else model
+        
+        with torch.no_grad():
+            msd = model_to_use.state_dict()
+            for name, param in self.shadow.named_parameters():
+                if name in msd:
+                    new_param = msd[name]
+                    # 确保设备一致
+                    if param.device != new_param.device:
+                         param.data = param.data.to(new_param.device)
+                    # EMA 公式: shadow = decay * shadow + (1 - decay) * new_param
+                    param.data.mul_(self.decay).add_(new_param.data, alpha=1 - self.decay)
+    def apply_shadow(self, model: nn.Module):
+        """将 EMA 权重赋值给原模型 (通常在推理或保存最佳模型前使用)"""
+        model_to_use = model.module if hasattr(model, 'module') else model
+        model_to_use.load_state_dict(self.shadow.state_dict())
+
 class Trainer:
     """
-    一个增强版的全功能训练/评估迭代器。
+    一个全功能的 PyTorch 训练/评估迭代器封装类。
+    该类旨在通过生成器模式 (Generator Pattern) 简化训练循环，同时保留极高的灵活性。
     
-    支持：
-    - 自动混合精度训练 (AMP)
-    - 梯度累积 (Gradient Accumulation)
-    - 梯度裁剪 (Gradient Clipping)
-    - 训练历史记录 (History Tracking)
-    - 断点续训 (Resume Training)
-    - 灵活的训练/评估循环 (Generator based loop)
+    主要特性:
+    - **自动混合精度 (AMP)**: 支持 fp16 训练。
+    - **梯度策略**: 支持梯度累积 (Gradient Accumulation) 和梯度裁剪 (Gradient Clipping)。
+    - **生命周期管理**: 支持断点续训 (Resume)、模型保存 (Checkpointing)、早停 (Early Stopping)。
+    - **可视化**: 集成 TensorBoard 日志记录。
+    - **易用性**: 自动处理设备移动、进度条显示 (tqdm) 和指标计算。
+    - **高级功能**: 支持 EMA、DataParallel、推理预测 (Predict)。
+    Attributes:
+        model (nn.Module): 正在训练的模型。
+        device (torch.device): 当前运行设备。
+        history (Dict): 记录训练过程中的 loss 和 metric 历史。
+        global_step (int): 全局训练步数计数器。
     """
+
     def __init__(
         self,
         model: nn.Module,
@@ -69,23 +114,25 @@ class Trainer:
         use_amp: bool = False,
         accumulation_steps: int = 1,
         grad_clip_norm: Optional[float] = None,
+        use_ema: bool = False,
+        ema_decay: float = 0.999
     ) -> None:
         """
-        初始化 Trainer。
+        初始化 Trainer 实例。
 
         Args:
-            model: 待训练模型。
-            num_epochs: 总 Epoch 数。
-            train_loader: 训练数据加载器。
-            test_loader: 测试数据加载器。
-            optimizer: 优化器。
-            criterion: 损失函数。
-            scheduler: 学习率调度器。
-            checkpoint_path: 检查点保存路径 (例如 'checkpoints/last.pt')。
-            device: 运行设备 (默认自动检测)。
-            use_amp: 是否开启自动混合精度训练 (需 GPU 支持)。
-            accumulation_steps: 梯度累积步数 (默认为1，即不累积)。
-            grad_clip_norm: 梯度裁剪的范数阈值 (None 表示不裁剪)。
+            model (nn.Module): 待训练的 PyTorch 模型。
+            num_epochs (int): 训练的总 Epoch 数。
+            train_loader (DataLoader, optional): 训练数据加载器。
+            test_loader (DataLoader, optional): 验证/测试数据加载器。
+            optimizer (Optimizer, optional): 优化器实例。
+            criterion (nn.Module, optional): 损失函数实例。
+            scheduler (_LRScheduler, optional): 学习率调度器。
+            checkpoint_path (str, optional): 检查点保存路径 (例如 'checkpoints/ckpt.pt')。
+            device (torch.device, optional): 指定运行设备。若为 None 则自动检测 CUDA/CPU。
+            use_amp (bool): 是否开启自动混合精度训练 (需要 GPU 支持)。
+            accumulation_steps (int): 梯度累积步数，默认为 1 (不累积)。
+            grad_clip_norm (float, optional): 梯度裁剪的最大范数。None 表示不裁剪。
         """
         self.model = model
         self.num_epochs = num_epochs
@@ -102,25 +149,42 @@ class Trainer:
         self.accumulation_steps = accumulation_steps
         self.grad_clip_norm = grad_clip_norm
 
-        # --- 设备管理 ---
+        # --- 设备管理与 DataParallel ---
+        # 逻辑顺序：确定 Device -> 移动模型 -> 包装 DataParallel
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
+            
+        # 先将模型移动到指定设备 (这对 DataParallel 很重要)
         self.model.to(self.device)
+        
+        # 自动检测并应用 DP (无论 device 是手动传入还是自动检测)
+        self.use_dp = False
+        self._try_init_dataparallel()
+
+        # --- 初始化 EMA ---
+        self.use_ema = use_ema
+        self.ema = ModelEMA(self.model, decay=ema_decay) if use_ema else None
+        if self.use_ema:
+            print(f"EMA enabled with decay {ema_decay}")
 
         # --- 状态变量 ---
         self.epoch: int = 0
+        self.start_epoch: int = 0
         self.batch_idx: int = 0
-        self.global_step: int = 0  # 记录总的 batch 步数
-        self.data: Optional[Any] = None
-        self.target: Optional[Any] = None
+        self.global_step: int = 0  # 记录总的 optimizer step 次数 (batch数)
         
+        # 当前 Batch 的数据
+        self.data: Optional[Union[torch.Tensor, Tuple[torch.Tensor]]] = None
+        self.target: Optional[torch.Tensor] = None
+        
+        # 循环控制标志
         self.is_first_batch_in_epoch: bool = False
         self.is_last_batch_in_epoch: bool = False
-        self.start_epoch: int = 0
         
-        self.loss: Optional[torch.Tensor] = None # 当前 batch loss
+        # 统计变量
+        self.loss: Optional[torch.Tensor] = None # 最近一次 forward 的 loss
         self.running_loss: float = 0.0 # 当前 epoch 累计 loss
         self.running_samples: int = 0  # 当前 epoch 累计样本数
         
@@ -137,9 +201,15 @@ class Trainer:
         }
         self.best_val_metric = -float('inf') # 用于保存 best model
 
+        # --- TensorBoard & Early Stopping ---
+        self.writer = None  # TensorBoard writer
+        self.patience_counter: int = 0 # 早停计数器
+        self.best_metric_for_es: Optional[float] = None # 用于早停的最佳指标
+
         # --- 初始化 ---
         self._display_model_summary()
         if self.checkpoint_path is not None:
+            # 尝试自动加载 'last.pt' 或指定路径
             self.load_checkpoint()
 
     @property
@@ -160,21 +230,159 @@ class Trainer:
         if self.total_predictions == 0:
             return 0.0
         return self.correct_predictions / self.total_predictions
+    
+    def _try_init_dataparallel(self):
+        """尝试初始化 DataParallel"""
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs with DataParallel!")
+            self.model = nn.DataParallel(self.model)
+            self.use_dp = True
+        else:
+            self.use_dp = False
 
     def _display_model_summary(self):
-        """打印模型结构、参数量及运行设备信息。"""
-        print("-" * 60)
-        print(f"Model: {self.model.__class__.__name__}")
-        print(f"Device: {self.device} | AMP: {self.use_amp}")
-        print(f"Gradient Accumulation: {self.accumulation_steps} steps")
-        total = sum(p.numel() for p in self.model.parameters())
-        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"Params: {total / 1e6:.2f}M (Trainable: {trainable / 1e6:.2f}M)")
-        print("-" * 60)
-
-    def _process_batch_data(self, batch_data):
         """
-        处理 Batch 数据，移动到计算设备并拆分 data/target。
+        打印丰富的模型结构、环境信息及参数统计。
+        支持自动调用 torchinfo (如果已安装)。
+        """
+        import sys
+        
+        # 1. 获取实际模型 (处理 DataParallel)
+        real_model = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        # 2. 基础统计
+        total_params = sum(p.numel() for p in real_model.parameters())
+        trainable_params = sum(p.numel() for p in real_model.parameters() if p.requires_grad)
+        # 估算模型权重占用的显存 (Float32 = 4 bytes)
+        # 注意：这只是静态权重，不包含中间激活值和梯度
+        param_memory_mb = total_params * 4 / (1024 ** 2) 
+        
+        # 3. 格式化打印
+        print("=" * 80)
+        print(f"🟢 SYSTEM & ENV SUMMARY")
+        print("-" * 80)
+        print(f"{'PyTorch Version':<20} : {torch.__version__}")
+        print(f"{'Python Version':<20} : {sys.version.split()[0]}")
+        print(f"{'Device':<20} : {self.device}")
+        
+        if self.device.type == 'cuda':
+            gpu_name = torch.cuda.get_device_name(self.device)
+            print(f"{'GPU Name':<20} : {gpu_name}")
+            print(f"{'CUDA Version':<20} : {torch.version.cuda}")
+            if hasattr(self, 'use_dp') and self.use_dp:
+                 print(f"{'Distributed':<20} : DataParallel (GPUs: {torch.cuda.device_count()})")
+        
+        print("-" * 80)
+        print(f"🔵 TRAINING CONFIG")
+        print("-" * 80)
+        print(f"{'AMP (Mixed Precision)':<25} : {'ON' if self.use_amp else 'OFF'}")
+        print(f"{'Gradient Accumulation':<25} : {self.accumulation_steps} steps")
+        print(f"{'Gradient Clipping':<25} : {self.grad_clip_norm if self.grad_clip_norm else 'OFF'}")
+        print(f"{'Optimizer':<25} : {self.optimizer.__class__.__name__ if self.optimizer else 'None'}")
+        if self.optimizer:
+            try:
+                lr = self.optimizer.param_groups[0]['lr']
+                print(f"{'Initial Learning Rate':<25} : {lr}")
+            except: pass
+        print(f"{'EMA (Exp Moving Avg)':<25} : {'ON' if (hasattr(self, 'use_ema') and self.use_ema) else 'OFF'}")
+
+        print("-" * 80)
+        print(f"🟡 MODEL SUMMARY: {real_model.__class__.__name__}")
+        print("-" * 80)
+        print(f"{'Layer (type)':<30} | {'Params':>12} | {'Trainable':>10}")
+        print("-" * 60)
+        
+        for name, module in real_model.named_children():
+            # 计算子模块参数
+            mod_params = sum(p.numel() for p in module.parameters())
+            mod_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            is_train = "Yes" if mod_trainable > 0 else "No"
+            name_str = f"{name} ({module.__class__.__name__})"
+            # 截断过长的名字
+            if len(name_str) > 28: name_str = name_str[:25] + "..."
+            
+            print(f"{name_str:<30} | {mod_params:>12,} | {is_train:>10}")
+        
+        print("-" * 60)
+        print(f"{'Total Params':<30} : {total_params:,}")
+        print(f"{'Trainable Params':<30} : {trainable_params:,} ({trainable_params/total_params:.1%})")
+        print(f"{'Non-Trainable Params':<30} : {total_params - trainable_params:,}")
+        print(f"{'Est. Model Size (Weights)':<30} : {param_memory_mb:.2f} MB")
+        
+        print("=" * 80)
+
+    def init_tensorboard(self, log_dir: str = "runs"):
+        """
+        初始化 TensorBoard SummaryWriter。
+
+        Args:
+            log_dir (str): 日志保存目录。
+        """
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir=log_dir)
+            print(f"TensorBoard initialized. Logs will be saved to: {log_dir}")
+        except ImportError:
+            print("Warning: TensorBoard not found. Install it using 'pip install tensorboard'.")
+
+    def log(self, metrics: Dict[str, float], step: Optional[int] = None):
+        """
+        手动记录指标到 TensorBoard。
+
+        Args:
+            metrics (Dict[str, float]): 指标字典，如 {'Val/Loss': 0.5, 'Val/Acc': 0.9}。
+            step (int, optional): 当前步数。如果不填，默认使用 self.global_step。
+        """
+        if self.writer is None:
+            return
+        
+        step_to_use = step if step is not None else self.global_step
+        for key, value in metrics.items():
+            self.writer.add_scalar(key, value, step_to_use)
+
+    def check_early_stopping(self, current_metric: float, monitor: str = 'val_loss', patience: int = 5) -> bool:
+        """
+        检查是否触发早停 (Early Stopping)。
+
+        Args:
+            current_metric (float): 当前 epoch 的验证指标值。
+            monitor (str): 监控指标名称 ('val_loss' 或 'val_acc')，用于决定是 'min' 还是 'max' 模式。
+                           包含 'loss' 视为越小越好，否则视为越大越好。
+            patience (int): 容忍多少个 epoch 指标未改善。
+
+        Returns:
+            bool: 如果返回 True，则应当停止训练循环。
+        """
+        # 首次调用初始化
+        if self.best_metric_for_es is None:
+             self.best_metric_for_es = float('inf') if 'loss' in monitor.lower() else -float('inf')
+
+        is_better = False
+        if 'loss' in monitor.lower():
+            if current_metric < self.best_metric_for_es:
+                is_better = True
+        else:
+            if current_metric > self.best_metric_for_es:
+                is_better = True
+
+        if is_better:
+            self.best_metric_for_es = current_metric
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+            # 只有在计数器增加时才打印
+            if self.patience_counter > 0:
+                print(f"Early Stopping Counter: {self.patience_counter}/{patience}")
+
+        if self.patience_counter >= patience:
+            print(f"Early stopping triggered after {patience} epochs without improvement.")
+            return True
+        
+        return False
+
+    def _process_batch_data(self, batch_data: Any):
+        """
+        内部方法：处理 Batch 数据，将其移动到计算设备并拆分为 data 和 target。
         
         Args:
             batch_data: DataLoader 返回的一个 batch 数据。
@@ -182,30 +390,26 @@ class Trainer:
         if isinstance(batch_data, (list, tuple)):
             if len(batch_data) > 1:
                 # 假设最后一个是 target，前面都是 input
-                self.data = tuple(d.to(self.device) for d in batch_data[:-1])
+                # 处理多输入的情况
+                inputs = tuple(d.to(self.device) for d in batch_data[:-1])
                 self.target = batch_data[-1].to(self.device)
-                if len(self.data) == 1:
-                    self.data = self.data[0]
+                
+                # 如果只有一个输入，解包 tuple
+                if len(inputs) == 1:
+                    self.data = inputs[0]
+                else:
+                    self.data = inputs
             else:
-                # 只有 data 没有 target (用于推理)
+                # 只有数据没有标签（如无监督学习）
                 self.data = batch_data[0].to(self.device)
                 self.target = None
         else:
-            # 假设 batch_data 本身就是 input，没有 target? 
-            # 这里通常应该是 list/tuple，或者是字典，视 dataset 而定。
-            # 为兼容旧逻辑：
+            # 只有 tensor
             self.data = batch_data.to(self.device)
             self.target = None
 
     def _create_train_iterator(self, data_loader: DataLoader, tqdm_bar: bool, print_loss: bool) -> Generator['Trainer', None, None]:
-        """
-        内部生成器：执行训练循环逻辑。
-
-        Args:
-            data_loader: 数据加载器。
-            tqdm_bar: 是否显示进度条。
-            print_loss: Epoch 结束时是否打印 Loss。
-        """
+        """内部方法：生成训练循环的迭代器。"""
         self.model.train()
         num_batches = len(data_loader)
         
@@ -224,26 +428,41 @@ class Trainer:
                 self.is_first_batch_in_epoch = (batch_idx == 0)
                 self.is_last_batch_in_epoch = (batch_idx == num_batches - 1)
                 
+                # Yield self allowing external control loop
                 yield self
             
-            # Epoch 结束记录训练 Loss
+            # Epoch 结束记录
             epoch_loss = self.epoch_mean_loss
             self.history['train_loss'].append(epoch_loss)
             
+            # Log epoch loss to TensorBoard
+            self.log({'Train/Epoch_Loss': epoch_loss}, step=self.display_epoch)
+            
             if print_loss:
-                print(f"Epoch {self.display_epoch} finished: Avg Loss = {epoch_loss:.4f}")
+                print(f"Epoch {self.display_epoch} finished: Avg Loss = {epoch_loss:.6f}")
+            
+            # 可以在这里加入 scheduler step (epoch级)
+            if self.scheduler is not None and not isinstance(self.scheduler, ReduceLROnPlateau):
+                # 简单的 epoch step，如果需要 metric step 需在外部调用 auto_step_scheduler
+                if not hasattr(self.scheduler, 'step_batch'): # 排除 warmup 等 batch 级 scheduler
+                     self.scheduler.step()
 
     def train(self, train_loader: Optional[DataLoader] = None, tqdm_bar: bool = True, print_loss: bool = True) -> Iterator['Trainer']:
         """
         创建训练迭代器。
+        
+        使用方法:
+            for trainer in trainer.train():
+                loss = trainer.auto_update()
+                # 或者自定义 update 逻辑
 
         Args:
-            train_loader (Optional[DataLoader]): 覆盖初始化的 train_loader。
-            tqdm_bar (bool): 是否显示 tqdm 进度条。
-            print_loss (bool): 是否在 Epoch 结束打印 Loss。
+            train_loader (DataLoader, optional): 覆盖初始化的 DataLoader。
+            tqdm_bar (bool): 是否显示进度条。
+            print_loss (bool): 是否在 Epoch 结束时打印平均 Loss。
 
-        Yields:
-            Trainer: 返回 Trainer 实例本身，供外部循环调用 `auto_update` 等方法。
+        Returns:
+            Iterator['Trainer']: 产生 Trainer 实例的生成器。
         """
         loader = train_loader if train_loader else self.train_loader
         if not loader:
@@ -251,16 +470,8 @@ class Trainer:
         return self._create_train_iterator(loader, tqdm_bar, print_loss)
 
     def _create_eval_iterator(self, data_loader: DataLoader, description: str, tqdm_bar: bool) -> Generator['Trainer', None, None]:
-        """
-        内部生成器：执行评估/推理循环逻辑。
-
-        Args:
-            data_loader: 数据加载器。
-            description: 进度条描述文本。
-            tqdm_bar: 是否显示进度条。
-        """
+        """内部方法：生成评估循环的迭代器。"""
         self.model.eval()
-        # 重置评估统计
         self.eval_loss = 0.0
         self.correct_predictions = 0
         self.total_predictions = 0
@@ -274,19 +485,24 @@ class Trainer:
                     self._process_batch_data(batch_data)
                     yield self
         finally:
+            # 恢复训练模式
             self.model.train()
 
     def eval(self, test_loader: Optional[DataLoader] = None, description: str = "Evaluating", tqdm_bar: bool = True) -> Iterator['Trainer']:
         """
         创建评估迭代器。
 
+        使用方法:
+            for trainer in trainer.eval():
+                trainer.calculate_classification_metrics()
+
         Args:
-            test_loader (Optional[DataLoader]): 覆盖初始化的 test_loader。
-            description (str): 进度条前缀描述。
+            test_loader (DataLoader, optional): 覆盖初始化的 DataLoader。
+            description (str): 进度条描述文字。
             tqdm_bar (bool): 是否显示进度条。
 
-        Yields:
-            Trainer: 返回 Trainer 实例，供外部计算指标。
+        Returns:
+            Iterator['Trainer']: 产生 Trainer 实例的生成器。
         """
         loader = test_loader if test_loader else self.test_loader
         if not loader:
@@ -295,33 +511,44 @@ class Trainer:
 
     def update(self, loss: torch.Tensor, step_plateau_with_train_loss: bool = False) -> None:
         """
-        执行反向传播及参数更新。包含：梯度缩放(AMP)、梯度累积、梯度裁剪、优化器更新。
+        执行反向传播及参数更新的核心逻辑。
+        
+        包含：梯度缩放 (AMP)、梯度累积、梯度裁剪、优化器更新。
 
         Args:
             loss (torch.Tensor): 计算出的损失值。
-            step_plateau_with_train_loss (bool): 若使用 ReduceLROnPlateau，是否使用训练 Loss 来更新调度器。
+            step_plateau_with_train_loss (bool): 是否使用训练 Loss 更新 ReduceLROnPlateau 调度器。
         """
         if self.optimizer is None:
             raise RuntimeError("Optimizer is not set.")
-
-        # 1. 根据累积步数归一化 Loss
         loss = loss / self.accumulation_steps
-
-        # 2. 反向传播 (AMP vs Normal)
         if self.use_amp and self.scaler:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
-
-        # 3. 仅在累积达到步数 或 Epoch 最后一个 Batch 时更新参数
-        if (self.batch_idx + 1) % self.accumulation_steps == 0 or self.is_last_batch_in_epoch:
+        if (self.global_step % self.accumulation_steps == 0) or self.is_last_batch_in_epoch:
             
-            # 梯度裁剪 (处理 AMP 需要先 unscale)
+            # AMP Unscale (为了能够正确计算梯度范数和裁剪)
+            if self.use_amp and self.scaler:
+                self.scaler.unscale_(self.optimizer)
+            # 记录梯度范数 (Gradient Norm) ---
+            # 如果启用了裁剪，clip_grad_norm_ 会返回原始范数；
+            # 如果未启用裁剪，我们需要手动计算范数用于记录。
+            grad_norm = 0.0
             if self.grad_clip_norm is not None:
-                if self.use_amp and self.scaler:
-                    self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                grad_norm = grad_norm.item()
+            else:
+                # 手动计算范数用于日志 (不修改梯度)
+                parameters = [p for p in self.model.parameters() if p.grad is not None]
+                if parameters:
+                    device = parameters[0].grad.device
+                    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2).to(device) for p in parameters]), 2)
+                    grad_norm = total_norm.item()
+            
+            # 记录到 TensorBoard
+            if self.writer is not None:
+                self.writer.add_scalar('Train/Grad_Norm', grad_norm, self.global_step)
             # 优化器步进
             if self.use_amp and self.scaler:
                 self.scaler.step(self.optimizer)
@@ -330,24 +557,29 @@ class Trainer:
                 self.optimizer.step()
                 
             self.optimizer.zero_grad()
+            
+            # 更新 EMA
+            if self.use_ema and self.ema is not None:
+                self.ema.update(self.model)
         
-        # 更新调度器 (仅 epoch 结束)
         self.auto_step_scheduler(loss * self.accumulation_steps, step_plateau_with_train_loss)
 
     def auto_update(self, step_plateau_with_train_loss: bool = False) -> torch.Tensor:
         """
         自动执行完整训练步：Forward -> Loss -> Backward -> Update。
+        
+        如果 TensorBoard 已启用，会自动记录 Batch Loss 和学习率。
 
         Args:
-            step_plateau_with_train_loss (bool): 是否使用 Train Loss 更新调度器。
+            step_plateau_with_train_loss (bool): 传递给 update 方法。
 
         Returns:
-            torch.Tensor: 当前 Batch 的 Loss 值。
+            torch.Tensor: 当前 batch 的原始 Loss 值 (未经过 accumulate 缩放)。
         """
         if not self.optimizer or not self.criterion:
             raise RuntimeError("Optimizer or Criterion missing.")
         
-        # 前向传播 (With AMP context support)
+        # Forward & Loss
         with autocast(device_type=self.device.type, enabled=self.use_amp):
             if isinstance(self.data, tuple):
                 logits = self.model(*self.data)
@@ -356,98 +588,174 @@ class Trainer:
             
             loss = self.criterion(logits, self.target)
         
+        if loss.ndim > 0:
+            loss = loss.mean()
         self.loss = loss
         
-        # 统计 Running Loss (还原 Batch Size 影响)
+        # 统计 Running Loss
         batch_size = self.target.size(0) if hasattr(self.target, 'size') else 1
-        self.running_loss += loss.item() * batch_size
+        loss_scalar = loss.item()
+        self.running_loss += loss_scalar * batch_size
         self.running_samples += batch_size
 
+        # 自动记录 TensorBoard (Batch级)
+        if self.writer is not None:
+            self.writer.add_scalar('Train/Batch_Loss', loss_scalar, self.global_step)
+            # 记录学习率 (取第一个 param_group)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.writer.add_scalar('Train/LR', current_lr, self.global_step)
+
+        # Backward & Update
         self.update(loss, step_plateau_with_train_loss)
         return loss
 
     def auto_step_scheduler(self, loss_val: Optional[torch.Tensor] = None, use_train_loss: bool = False) -> None:
         """
-        Epoch 结束时自动更新调度器。
-        
-        Args:
-            loss_val: 当前的 Loss 值 (用于 ReduceLROnPlateau)。
-            use_train_loss: 是否强制使用传入的 loss_val 更新调度器。
+        辅助方法：根据调度器类型自动执行 step。
+        主要用于处理 ReduceLROnPlateau 需要 metric 的情况。
         """
-        if not self.is_last_batch_in_epoch or self.scheduler is None:
+        if self.scheduler is None:
             return
 
+        # 如果是 Plateau 调度器，通常在 Epoch 结束时调用，但如果用户希望基于 batch loss 也可以
         if isinstance(self.scheduler, ReduceLROnPlateau):
-            # 只有在明确要求使用 train loss 或者在纯训练循环中才使用 train loss 更新
-            if use_train_loss and loss_val is not None:
+            if use_train_loss and loss_val is not None and self.is_last_batch_in_epoch:
                 self.scheduler.step(loss_val.item())
-            # 否则通常 ReduceLROnPlateau 是在 validation loop 后由用户手动调用 step(val_loss)
-        else:
-             # StepLR, CosineAnnealingLR 等通常不带 metric 参数
-            self.scheduler.step()
+        # 如果是 OneCycleLR 或其他需要每个 batch step 的调度器
+        elif hasattr(self.scheduler, 'step_batch'): # 自定义属性标记或检查类型
+             pass # 通常由外部显式调用，或者在这里添加逻辑
 
     def calculate_classification_metrics(self) -> float:
         """
-        计算简单的分类任务准确率指标，更新内部状态(eval_loss, correct_predictions)。
+        计算常规分类任务的 Loss 和 Accuracy。
+        更新 eval_loss 和 correct_predictions。
 
         Returns:
-            float: 当前 Batch 的 Loss (scalar)。
+            float: 当前 Batch 的 Loss。
         """
         with autocast(device_type=self.device.type, enabled=self.use_amp):
-            logits = self.model(self.data) if not isinstance(self.data, tuple) else self.model(*self.data)
-            logits = match_shape_if_needed(logits, self.target)
-            loss = self.criterion(logits, self.target) if self.criterion else torch.tensor(0.0)
+            if isinstance(self.data, tuple):
+                logits = self.model(*self.data)
+            else:
+                logits = self.model(self.data)
+            
+            # 处理 shape [N,1] vs [N]
+            logits_squeezed = match_shape_if_needed(logits, self.target)
+            loss = self.criterion(logits_squeezed, self.target) if self.criterion else torch.tensor(0.0)
 
-        self.eval_loss += loss.item() * self.target.size(0)
-        self.total_predictions += self.target.size(0)
+        batch_size = self.target.size(0)
+        self.eval_loss += loss.item() * batch_size
+        self.total_predictions += batch_size
         
         # 计算 Acc
+        # 多分类 (Logits shape [N, C], C > 1)
         if logits.ndim > 1 and logits.shape[1] > 1:
-            # 多分类
             preds = logits.argmax(dim=1)
-            if self.target.ndim > 1: # target 也是 one-hot
+            if self.target.ndim > 1: # target 是 one-hot 或 probabilities
                 targets = self.target.argmax(dim=1)
-            else:
+            else: # target 是 indices
                 targets = self.target
             self.correct_predictions += (preds == targets).sum().item()
+        # 二分类 (Logits shape [N, 1] 或 [N])
         else:
-            # 二分类 (sigmoid)
-            preds = (torch.sigmoid(logits) > 0.5).float()
+            # 假设 logits 为 raw score，应用 sigmoid
+            if logits_squeezed.ndim == 0: # scalar
+                 preds = (torch.sigmoid(logits_squeezed) > 0.5).float()
+            else:
+                 preds = (torch.sigmoid(logits_squeezed) > 0.5).float()
             self.correct_predictions += (preds == self.target).sum().item()
             
         return loss.item()
 
     def record_history(self, current_val_loss: float = None, current_val_acc: float = None):
         """
-        手动记录验证集指标到 history 字典中。
-
-        Args:
-            current_val_loss: 验证集 Loss。
-            current_val_acc: 验证集 Accuracy。
+        手动将验证集指标添加到 history 字典中。
         """
         if current_val_loss is not None:
             self.history['val_loss'].append(current_val_loss)
         if current_val_acc is not None:
             self.history['val_acc'].append(current_val_acc)
 
+    def predict(self, data_loader: DataLoader, return_targets: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        执行推理并返回所有样本的预测结果。
+        
+        Args:
+            data_loader: 推理数据加载器。
+            return_targets: 是否同时也返回标签 (用于计算混淆矩阵等)。
+            
+        Returns:
+            predictions (Tensor): 拼接后的预测结果 (CPU Tensor)。
+            targets (Tensor, optional): 拼接后的标签 (CPU Tensor)。
+        """
+        self.model.eval()
+        # 如果使用了 EMA，建议在推理时使用 EMA 的权重 (可选，这里暂不强制覆盖，以免影响后续训练)
+        # 你可以手动调用 trainer.ema.apply_shadow(trainer.model) 来应用
+        
+        preds_list = []
+        targets_list = []
+        
+        print(f"Predicting on {len(data_loader.dataset)} samples...")
+        try:
+            with torch.no_grad():
+                for batch_data in tqdm(data_loader, desc="Predicting", leave=False):
+                    self._process_batch_data(batch_data)
+                    
+                    # Forward
+                    with autocast(device_type=self.device.type, enabled=self.use_amp):
+                        if isinstance(self.data, tuple):
+                            logits = self.model(*self.data)
+                        else:
+                            logits = self.model(self.data)
+                    
+                    # 移动到 CPU 以防显存溢出
+                    preds_list.append(logits.detach().cpu())
+                    
+                    if return_targets and self.target is not None:
+                        targets_list.append(self.target.detach().cpu())
+                        
+        finally:
+            self.model.train() # 恢复训练模式
+
+        if len(preds_list) == 0:
+            return torch.tensor([])
+
+        predictions = torch.cat(preds_list, dim=0)
+        
+        if return_targets and len(targets_list) > 0:
+            targets = torch.cat(targets_list, dim=0)
+            return predictions, targets
+            
+        return predictions
+
     def auto_checkpoint(self, metrics: Optional[Dict[str, float]] = None, save_best_only: bool = False, monitor: str = 'val_acc') -> None:
         """
-        自动保存检查点。根据 monitor 指标自动判断是否保存为最佳模型。
+        自动保存检查点。
+        
+        在 Epoch 结束时调用。会保存 'last.pt'。
+        如果提供了 metrics 且 monitor 指标优于历史最佳，则保存 'best_model.pt'。
 
         Args:
-            metrics: 当前 epoch 的指标字典，用于判断是否是最佳模型 (例如 {'val_loss': 0.5, 'val_acc': 0.9})。
-            save_best_only: (该参数暂未在逻辑中完全隔离，目前逻辑是同时保存 last 和 best)。
-            monitor: 监控哪个指标来决定 best model (例如 'val_acc' 或 'val_loss')。
+            metrics (Dict): 当前 Epoch 的评估指标字典。
+            save_best_only (bool): 这里的逻辑通常是只保留 best，但本函数会同时保留 last。
+            monitor (str): 监控的指标 key，用于判断最佳模型。
         """
         if not self.is_last_batch_in_epoch or not self.checkpoint_path:
             return
         
+        # 1. 保存当前最新状态
+        self.save_checkpoint(extra_info=metrics) # 默认保存到 self.checkpoint_path
+        
+        # 2. 判断是否为最佳模型
         is_best = False
         if metrics and monitor in metrics:
             current_val = metrics[monitor]
-            # 简单的 best 逻辑：loss越小越好，acc越大越好
+            
+            # 初始化 best metric
+            if self.best_val_metric == -float('inf') and 'loss' in monitor:
+                 self.best_val_metric = float('inf')
+
             if 'loss' in monitor:
-                if self.best_val_metric == -float('inf'): self.best_val_metric = float('inf')
                 if current_val < self.best_val_metric:
                     self.best_val_metric = current_val
                     is_best = True
@@ -456,36 +764,36 @@ class Trainer:
                     self.best_val_metric = current_val
                     is_best = True
         
-        # 保存最新
-        self.save_checkpoint(extra_info=metrics)
-        # 保存最佳
         if is_best:
             best_path = os.path.join(os.path.dirname(self.checkpoint_path), 'best_model.pt')
             self.save_checkpoint(path=best_path, extra_info=metrics)
             print(f" -> New best model saved at epoch {self.display_epoch} ({monitor}: {metrics[monitor]:.4f})")
 
     def save_checkpoint(self, path: Optional[str] = None, extra_info: Optional[Dict[str, Any]] = None) -> None:
-        """
-        保存模型检查点。
-
-        Args:
-            path: 保存路径 (默认使用初始化时的 checkpoint_path)。
-            extra_info: 需要额外保存的字典信息。
-        """
         path_to_use = path if path is not None else self.checkpoint_path
         if path_to_use is None: return
         
         os.makedirs(os.path.dirname(path_to_use), exist_ok=True)
+
+        # 获取原始模型 state_dict
+        if isinstance(self.model, nn.DataParallel):
+            model_state = self.model.module.state_dict()
+        else:
+            model_state = self.model.state_dict()
         
         state = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+            'ema_state_dict': self.ema.shadow.state_dict() if (self.use_ema and self.ema) else None,
+            
             'history': self.history,
-            'best_val_metric': self.best_val_metric
+            'best_val_metric': self.best_val_metric,
+            'patience_counter': self.patience_counter,
+            'best_metric_for_es': self.best_metric_for_es
         }
         if extra_info:
             state.update(extra_info)
@@ -496,15 +804,6 @@ class Trainer:
             print(f"Error saving checkpoint {path_to_use}: {e}")
 
     def load_checkpoint(self, path: Optional[str] = None) -> 'Trainer':
-        """
-        加载模型检查点以恢复训练。
-
-        Args:
-            path: 检查点路径 (默认使用初始化时的 checkpoint_path)。
-
-        Returns:
-            Trainer: 返回自身实例。
-        """
         path_to_use = path if path is not None else self.checkpoint_path
         if path_to_use is None or not os.path.exists(path_to_use):
             return self
@@ -513,20 +812,33 @@ class Trainer:
         try:
             checkpoint = torch.load(path_to_use, map_location=self.device)
             
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            # 加载权重
+            if isinstance(self.model, nn.DataParallel):
+                # 如果当前是多卡，加载到 model.module
+                self.model.module.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                # 如果当前是单卡，直接加载
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            
             if self.optimizer and checkpoint.get('optimizer_state_dict'):
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if self.scheduler and checkpoint.get('scheduler_state_dict'):
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if self.scaler and checkpoint.get('scaler_state_dict'):
                 self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                
+            
+            if self.use_ema and self.ema and checkpoint.get('ema_state_dict'):
+                self.ema.shadow.load_state_dict(checkpoint['ema_state_dict'])
+                print("EMA state loaded.")
+
             self.start_epoch = checkpoint.get('epoch', -1) + 1
             self.global_step = checkpoint.get('global_step', 0)
             self.history = checkpoint.get('history', self.history)
             self.best_val_metric = checkpoint.get('best_val_metric', -float('inf'))
+            self.patience_counter = checkpoint.get('patience_counter', 0)
+            self.best_metric_for_es = checkpoint.get('best_metric_for_es', None)
             
-            print(f"Resumed from Epoch {self.start_epoch}.")
+            print(f"Resumed from Epoch {self.display_epoch} (Global Step: {self.global_step}).")
         except Exception as e:
             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
             self.start_epoch = 0
@@ -535,17 +847,14 @@ class Trainer:
     
     def save_model(self, path: str) -> None:
         """
-        仅保存模型的权重参数 (state_dict)。
-        通常用于推理部署，文件体积比 checkpoint 小。
-
-        Args:
-            path (str): 保存路径 (例如 'models/resnet_weights.pth')。
+        仅保存模型的权重参数 (state_dict)，用于推理部署。
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            # 如果模型被 DataParallel 包装，建议保存 model.module.state_dict()
-            # 这里为了通用性，直接保存 model.state_dict()
-            torch.save(self.model.state_dict(), path)
+            if isinstance(self.model, nn.DataParallel):
+                torch.save(self.model.module.state_dict(), path)
+            else:
+                torch.save(self.model.state_dict(), path)
             print(f"Model weights saved to: {path}")
         except Exception as e:
             print(f"Error saving model weights to {path}: {e}")
@@ -553,11 +862,6 @@ class Trainer:
     def load_model(self, path: str, strict: bool = True) -> None:
         """
         加载模型权重。自动处理“纯权重文件”和“完整检查点文件”。
-
-        Args:
-            path (str): 权重文件路径。
-            strict (bool): 是否严格匹配键值 (默认 True)。
-                           如果做迁移学习(修改了网络层)，可设为 False 以忽略不匹配的键。
         """
         if not os.path.exists(path):
             print(f"Error: Model file not found at {path}")
@@ -567,19 +871,20 @@ class Trainer:
         try:
             state_dict = torch.load(path, map_location=self.device)
             
-            # 兼容性处理：如果传入的是完整 checkpoint 字典，则提取 model_state_dict
+            # 兼容完整 checkpoint 文件
             if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
                 print("Detected full checkpoint, extracting 'model_state_dict'...")
                 state_dict = state_dict['model_state_dict']
             
-            # 加载权重
-            missing, unexpected = self.model.load_state_dict(state_dict, strict=strict)
+            # 兼容处理 DataParallel 加载
+            if isinstance(self.model, nn.DataParallel):
+                missing, unexpected = self.model.module.load_state_dict(state_dict, strict=strict)
+            else:
+                missing, unexpected = self.model.load_state_dict(state_dict, strict=strict)
             
             if not strict:
-                if missing:
-                    print(f"Missing keys (ignored): {len(missing)} keys")
-                if unexpected:
-                    print(f"Unexpected keys (ignored): {len(unexpected)} keys")
+                if missing: print(f"Missing keys (ignored): {len(missing)}")
+                if unexpected: print(f"Unexpected keys (ignored): {len(unexpected)}")
             
             print("Model weights loaded successfully.")
             
