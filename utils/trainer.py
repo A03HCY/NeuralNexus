@@ -1,6 +1,10 @@
 import os
 import copy
 import random
+import time
+import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,6 +14,27 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 from torch.utils.data import DataLoader
 from typing import Any, Generator, Iterator, Optional, Dict, List, Union, Tuple
 from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+
+def plot_confusion_matrix(y_true, y_pred, class_names=None):
+    """
+    绘制混淆矩阵并返回 matplotlib figure 对象。
+    """
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names if class_names else "auto",
+                yticklabels=class_names if class_names else "auto")
+    plt.ylabel('Actual')
+    plt.xlabel('Predicted')
+    plt.tight_layout()
+    return fig
+
+def check_sanity(loss: torch.Tensor, step: int):
+    if torch.isnan(loss) or torch.isinf(loss):
+        print(f"CRITICAL WARNING: Loss became NaN or Inf at step {step}!")
+        return False
+    return True
 
 def set_seed(seed: int = 42):
     """
@@ -48,6 +73,33 @@ def match_shape_if_needed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.dim() == 2 and b.dim() == 1 and a.shape[1] == 1 and a.shape[0] == b.shape[0]:
          return a.squeeze(1)
     return a
+
+class TimingContext:
+    def __init__(self, name="Block"):
+        self.name = name
+    def __enter__(self):
+        self.start = time.time()
+        torch.cuda.synchronize() # 如果用 GPU，必须同步才能测准
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        torch.cuda.synchronize()
+        print(f"[{self.name}] elapsed: {(time.time() - self.start)*1000:.2f} ms")
+
+class Timer:
+    def __init__(self):
+        self.start_time = time.time()
+        self.epoch_start_time = 0
+    
+    def start_epoch(self):
+        self.epoch_start_time = time.time()
+        
+    def end_epoch(self) -> str:
+        elapsed = time.time() - self.epoch_start_time
+        return str(datetime.timedelta(seconds=int(elapsed)))
+    
+    def total_time(self) -> str:
+        elapsed = time.time() - self.start_time
+        return str(datetime.timedelta(seconds=int(elapsed)))
 
 class ModelEMA:
     """
@@ -192,6 +244,7 @@ class Trainer:
         self.eval_loss: float = 0.0
         self.correct_predictions: int = 0
         self.total_predictions: int = 0
+        self.timer = Timer()
 
         # --- 历史记录 ---
         self.history: Dict[str, List[float]] = {
@@ -345,6 +398,17 @@ class Trainer:
         step_to_use = step if step is not None else self.global_step
         for key, value in metrics.items():
             self.writer.add_scalar(key, value, step_to_use)
+    
+    def log_confusion_matrix(self, loader, class_names=None):
+        if self.writer is None: return
+        preds, targets = self.predict(loader, return_targets=True)
+        # 转换为类别索引
+        if preds.ndim > 1: preds = preds.argmax(dim=1)
+        if targets.ndim > 1: targets = targets.argmax(dim=1)
+        
+        fig = plot_confusion_matrix(targets.numpy(), preds.numpy(), class_names)
+        self.writer.add_figure("Eval/Confusion_Matrix", fig, self.global_step)
+        plt.close(fig)
 
     def check_early_stopping(self, current_metric: float, monitor: str = 'val_loss', patience: int = 5) -> bool:
         """
@@ -386,6 +450,94 @@ class Trainer:
         
         return False
 
+    def find_lr(self, train_loader: DataLoader, init_value: float = 1e-8, final_value: float = 10.0, beta: float = 0.98) -> None:
+        """
+        模拟训练以寻找最佳学习率。会绘制 Loss vs LR 曲线并保存到本地。
+        注意：运行此方法后会重置模型参数到运行前状态。
+        """
+        print("Finding learning rate...")
+        # 1. 保存当前状态以恢复
+        if isinstance(self.model, nn.DataParallel):
+            model_state = copy.deepcopy(self.model.module.state_dict())
+        else:
+            model_state = copy.deepcopy(self.model.state_dict())
+        optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+        
+        self.model.train()
+        num = len(train_loader) - 1
+        mult = (final_value / init_value) ** (1 / num)
+        lr = init_value
+        self.optimizer.param_groups[0]['lr'] = lr
+        
+        avg_loss = 0.0
+        best_loss = 0.0
+        batch_num = 0
+        losses = []
+        lrs = []
+        
+        # 禁用 AMP scaler 避免干扰，或者创建一个临时的
+        scaler = GradScaler() if self.use_amp else None
+        
+        try:
+            for batch_data in tqdm(train_loader, desc="LR Finder", leave=False):
+                batch_num += 1
+                self._process_batch_data(batch_data)
+                
+                # Forward
+                with autocast(device_type=self.device.type, enabled=self.use_amp):
+                    if isinstance(self.data, tuple):
+                        logits = self.model(*self.data)
+                    else:
+                        logits = self.model(self.data)
+                    loss = self.criterion(logits, self.target)
+                
+                # Compute the smoothed loss
+                loss_val = loss.item()
+                avg_loss = beta * avg_loss + (1 - beta) * loss_val
+                smoothed_loss = avg_loss / (1 - beta**batch_num)
+                
+                # Stop if the loss is exploding
+                if batch_num > 1 and smoothed_loss > 4 * best_loss:
+                    break
+                if smoothed_loss < best_loss or batch_num == 1:
+                    best_loss = smoothed_loss
+                
+                losses.append(smoothed_loss)
+                lrs.append(lr)
+                
+                # Optimize
+                self.optimizer.zero_grad()
+                if self.use_amp and scaler:
+                    scaler.scale(loss).backward()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
+                
+                # Update LR
+                lr *= mult
+                self.optimizer.param_groups[0]['lr'] = lr
+        finally:
+            # 2. 恢复模型状态
+            if isinstance(self.model, nn.DataParallel):
+                self.model.module.load_state_dict(model_state)
+            else:
+                self.model.load_state_dict(model_state)
+            self.optimizer.load_state_dict(optimizer_state)
+            print("LR Finder finished. Model state restored.")
+
+        # 3. 绘图
+        plt.figure(figsize=(10, 6))
+        plt.plot(lrs, losses)
+        plt.xscale('log')
+        plt.xlabel('Learning Rate')
+        plt.ylabel('Loss')
+        plt.title('Learning Rate Finder')
+        plt.grid(True, which="both", ls="-", alpha=0.5)
+        plt.savefig('lr_finder_result.png')
+        print("Result saved to 'lr_finder_result.png'.")
+
     def _process_batch_data(self, batch_data: Any):
         """
         内部方法：处理 Batch 数据，将其移动到计算设备并拆分为 data 和 target。
@@ -426,6 +578,7 @@ class Trainer:
             
             iterable = tqdm(data_loader, desc=f"Train Ep {self.display_epoch}/{self.num_epochs}", leave=False) if tqdm_bar else data_loader
 
+            self.timer.start_epoch()
             for batch_idx, batch_data in enumerate(iterable):
                 self.batch_idx = batch_idx
                 self.global_step += 1
@@ -438,6 +591,7 @@ class Trainer:
                 yield self
             
             # Epoch 结束记录
+            epoch_time = self.timer.end_epoch()
             epoch_loss = self.epoch_mean_loss
             self.history['train_loss'].append(epoch_loss)
             
@@ -445,7 +599,7 @@ class Trainer:
             self.log({'Train/Epoch_Loss': epoch_loss}, step=self.display_epoch)
             
             if print_loss:
-                print(f"Epoch {self.display_epoch} finished: Avg Loss = {epoch_loss:.6f}")
+                print(f"Epoch {self.display_epoch} finished in {epoch_time}. Avg Loss = {epoch_loss:.6f}")
             
             # 可以在这里加入 scheduler step (epoch级)
             if self.scheduler is not None and not isinstance(self.scheduler, ReduceLROnPlateau):
@@ -593,7 +747,9 @@ class Trainer:
                 logits = self.model(self.data)
             
             loss = self.criterion(logits, self.target)
-        
+
+        if not check_sanity(loss, self.global_step):
+            raise ValueError("Loss became NaN, stopping training.")
         if loss.ndim > 0:
             loss = loss.mean()
         self.loss = loss

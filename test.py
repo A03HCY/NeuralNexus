@@ -59,4 +59,6 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 model_trainer = Trainer(model, 1, criterion=criterion, optimizer=optimizer, checkpoint_path='./checkpoints/linear_mnist_model.pth')
 
+model_trainer.find_lr(train_loader)
+
 model_trainer.fit(train_loader, train_loader, cal_classification_metrics=True)
