@@ -77,10 +77,12 @@ def match_shape_if_needed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 class TimingContext:
     def __init__(self, name="Block"):
         self.name = name
+
     def __enter__(self):
         self.start = time.time()
         torch.cuda.synchronize() # 如果用 GPU，必须同步才能测准
         return self
+    
     def __exit__(self, exc_type, exc_val, exc_tb):
         torch.cuda.synchronize()
         print(f"[{self.name}] elapsed: {(time.time() - self.start)*1000:.2f} ms")
