@@ -1235,7 +1235,7 @@ class Trainer:
             self.patience_counter = checkpoint.get('patience_counter', 0)
             self.best_metric_for_es = checkpoint.get('best_metric_for_es', None)
             
-            print(f"Resumed from Epoch {self.display_epoch} (Global Step: {self.global_step}).")
+            print(f"Resumed from Epoch {self.display_epoch - 1} (Global Step: {self.global_step}).")
         except Exception as e:
             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
             self.start_epoch = 0
