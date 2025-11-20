@@ -14,7 +14,9 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 from torch.utils.data import DataLoader
 from typing import Any, Generator, Iterator, Optional, Dict, List, Union, Tuple
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
+from itertools import cycle
 
 def plot_confusion_matrix(y_true, y_pred, class_names=None):
     """
@@ -27,6 +29,62 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None):
                 yticklabels=class_names if class_names else "auto")
     plt.ylabel('Actual')
     plt.xlabel('Predicted')
+    plt.tight_layout()
+    return fig
+
+def plot_roc_curve(y_true, y_score, class_names=None):
+    """
+    绘制 ROC 曲线并返回 matplotlib figure 对象。
+    支持二分类和多分类 (One-vs-Rest)。
+    """
+    n_classes = len(class_names) if class_names else (y_score.shape[1] if y_score.ndim > 1 else 2)
+    
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # 二分类情况 (y_score shape [N, 1] or [N])
+    if n_classes == 2 or (y_score.ndim == 1) or (y_score.shape[1] == 1):
+        # 假设 y_score 是正类的概率
+        # 如果 y_score 是 [N, 1]，squeeze
+        if y_score.ndim == 2: y_score = y_score.squeeze()
+        
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    else:
+        # 多分类情况
+        # 需要将 y_true 二值化
+        y_true_bin = label_binarize(y_true, classes=range(n_classes))
+        
+        # 计算每一类的 ROC
+        fpr = dict()
+        tpr = dict()
+        roc_auc = dict()
+        for i in range(n_classes):
+            fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_score[:, i])
+            roc_auc[i] = auc(fpr[i], tpr[i])
+            
+        # 绘制微平均 ROC 曲线 (Micro-average)
+        fpr["micro"], tpr["micro"], _ = roc_curve(y_true_bin.ravel(), y_score.ravel())
+        roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+        
+        plt.plot(fpr["micro"], tpr["micro"],
+                 label=f'micro-average ROC curve (area = {roc_auc["micro"]:.2f})',
+                 color='deeppink', linestyle=':', linewidth=4)
+
+        # 绘制每一类的 ROC 曲线
+        colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'green', 'red', 'purple'])
+        for i, color in zip(range(n_classes), colors):
+            label = f'ROC curve of class {class_names[i] if class_names else i}'
+            label += f' (area = {roc_auc[i]:.2f})'
+            plt.plot(fpr[i], tpr[i], color=color, lw=2, label=label)
+
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC)')
+    plt.legend(loc="lower right")
     plt.tight_layout()
     return fig
 
@@ -261,11 +319,51 @@ class Trainer:
         self.patience_counter: int = 0 # 早停计数器
         self.best_metric_for_es: Optional[float] = None # 用于早停的最佳指标
 
+        # --- 混淆矩阵相关 ---
+        self.classes: Optional[Union[List, Tuple]] = None
+        self.top_k: Optional[int] = None
+        self.y_trues: List[torch.Tensor] = []
+        self.y_preds: List[torch.Tensor] = []
+        self.y_scores: List[torch.Tensor] = [] # 用于 ROC 曲线
+        self.correct_top_k_predictions: int = 0
+        self.enable_confusion_matrix: bool = False
+        self.enable_roc_curve: bool = False
+
         # --- 初始化 ---
         self._display_model_summary()
         if self.checkpoint_path is not None:
             # 尝试自动加载 'last.pt' 或指定路径
             self.load_checkpoint()
+
+    def init_classes(self, classes: Union[List, Tuple], top_k: Optional[int] = None, 
+                     force_confusion_matrix: bool = False, force_roc_curve: bool = False):
+        """
+        初始化类别名称列表，用于绘制混淆矩阵和 ROC 曲线。
+        
+        Args:
+            classes: 类别名称列表。
+            top_k: 如果指定，将在评估时计算 Top-k Accuracy。
+            force_confusion_matrix: 是否强制生成混淆矩阵 (即使类别数很多)。
+            force_roc_curve: 是否强制生成 ROC 曲线 (即使类别数很多)。
+        """
+        self.classes = classes
+        self.top_k = top_k
+        
+        num_classes = len(classes)
+        
+        # 智能判断是否开启混淆矩阵 (默认阈值 50)
+        if num_classes <= 50 or force_confusion_matrix:
+            self.enable_confusion_matrix = True
+        else:
+            self.enable_confusion_matrix = False
+            print(f"Confusion Matrix disabled due to large number of classes ({num_classes} > 50). Use force_confusion_matrix=True to override.")
+
+        # 智能判断是否开启 ROC 曲线 (默认阈值 10)
+        if num_classes <= 10 or force_roc_curve:
+            self.enable_roc_curve = True
+        else:
+            self.enable_roc_curve = False
+            print(f"ROC Curve disabled due to large number of classes ({num_classes} > 10). Use force_roc_curve=True to override.")
 
     @property
     def display_epoch(self) -> int:
@@ -379,7 +477,21 @@ class Trainer:
         """
         try:
             from torch.utils.tensorboard import SummaryWriter
+            
+            # 获取模型名称
+            real_model = self.model.module if hasattr(self.model, 'module') else self.model
+            model_name = real_model.__class__.__name__
+            
+            # 如果用户使用默认路径，自动添加模型名和时间戳
+            if log_dir == "runs":
+                timestamp = datetime.datetime.now().strftime("%b%d_%H-%M-%S")
+                log_dir = os.path.join("runs", f"{model_name}_{timestamp}")
+            
             self.writer = SummaryWriter(log_dir=log_dir)
+            
+            # 记录模型名称
+            self.writer.add_text("Model/Name", model_name)
+            
             print(f"TensorBoard initialized. Logs will be saved to: {log_dir}")
         except ImportError:
             print("Warning: TensorBoard not found. Install it using 'pip install tensorboard'.")
@@ -452,11 +564,14 @@ class Trainer:
         
         return False
 
-    def find_lr(self, train_loader: DataLoader, init_value: float = 1e-8, final_value: float = 10.0, beta: float = 0.98) -> None:
+    def find_lr(self, train_loader: DataLoader = None, init_value: float = 1e-8, final_value: float = 10.0, beta: float = 0.98) -> None:
         """
         模拟训练以寻找最佳学习率。会绘制 Loss vs LR 曲线并保存到本地。
         注意：运行此方法后会重置模型参数到运行前状态。
         """
+        train_loader = train_loader if train_loader else self.train_loader
+        if train_loader is None:
+            raise ValueError("No train_loader provided.")
         print("Finding learning rate...")
         # 1. 保存当前状态以恢复
         if isinstance(self.model, nn.DataParallel):
@@ -636,7 +751,9 @@ class Trainer:
         self.model.eval()
         self.eval_loss = 0.0
         self.correct_predictions = 0
+        self.correct_top_k_predictions = 0
         self.total_predictions = 0
+        num_batches = len(data_loader)
         
         try:
             iterable = tqdm(data_loader, desc=description, leave=False) if tqdm_bar else data_loader
@@ -644,6 +761,7 @@ class Trainer:
                 for batch_idx, batch_data in enumerate(iterable):
                     self.batch_idx = batch_idx
                     self.is_first_batch_in_epoch = (batch_idx == 0)
+                    self.is_last_batch_in_epoch = (batch_idx == num_batches - 1)
                     self._process_batch_data(batch_data)
                     yield self
         finally:
@@ -793,6 +911,7 @@ class Trainer:
         """
         计算常规分类任务的 Loss 和 Accuracy。
         更新 eval_loss 和 correct_predictions。
+        如果调用了 init_classes，还会累积预测结果并在 epoch 结束时绘制混淆矩阵。
 
         Returns:
             float: 当前 Batch 的 Loss。
@@ -811,10 +930,15 @@ class Trainer:
         self.eval_loss += loss.item() * batch_size
         self.total_predictions += batch_size
         
-        # 计算 Acc
+        # 计算 Acc 并准备混淆矩阵数据
+        preds = None
+        targets = None
+        scores = None # 用于 ROC
+
         # 多分类 (Logits shape [N, C], C > 1)
         if logits.ndim > 1 and logits.shape[1] > 1:
             preds = logits.argmax(dim=1)
+            scores = torch.softmax(logits, dim=1) # 概率
             if self.target.ndim > 1: # target 是 one-hot 或 probabilities
                 targets = self.target.argmax(dim=1)
             else: # target 是 indices
@@ -824,11 +948,87 @@ class Trainer:
         else:
             # 假设 logits 为 raw score，应用 sigmoid
             if logits_squeezed.ndim == 0: # scalar
-                 preds = (torch.sigmoid(logits_squeezed) > 0.5).float()
+                 scores = torch.sigmoid(logits_squeezed)
+                 preds = (scores > 0.5).float()
             else:
-                 preds = (torch.sigmoid(logits_squeezed) > 0.5).float()
-            self.correct_predictions += (preds == self.target).sum().item()
+                 scores = torch.sigmoid(logits_squeezed)
+                 preds = (scores > 0.5).float()
+            targets = self.target
+            self.correct_predictions += (preds == targets).sum().item()
+        
+        # 计算 Top-k Accuracy
+        if self.top_k is not None and logits.ndim > 1 and logits.shape[1] >= self.top_k:
+            # logits: [N, C], target: [N]
+            _, pred_topk = logits.topk(self.top_k, dim=1, largest=True, sorted=True) # [N, k]
+            pred_topk = pred_topk.t() # [k, N]
+            correct = pred_topk.eq(targets.view(1, -1).expand_as(pred_topk))
+            self.correct_top_k_predictions += correct.reshape(-1).float().sum().item()
+
+        # 累积混淆矩阵和 ROC 数据
+        if self.classes is not None:
+            if self.enable_confusion_matrix:
+                self.y_preds.append(preds.detach().cpu())
+                self.y_trues.append(targets.detach().cpu())
             
+            if self.enable_roc_curve:
+                # 确保 y_trues 也被收集 (如果上面没收集)
+                if not self.enable_confusion_matrix:
+                    self.y_trues.append(targets.detach().cpu())
+                self.y_scores.append(scores.detach().cpu())
+
+            # 如果是最后一个 batch，生成图表
+            if self.is_last_batch_in_epoch:
+                all_trues = torch.cat(self.y_trues).numpy()
+                
+                # 1. 混淆矩阵
+                if self.enable_confusion_matrix:
+                    all_preds = torch.cat(self.y_preds).numpy()
+                    fig_cm = plot_confusion_matrix(all_trues, all_preds, self.classes)
+                    if self.writer is not None:
+                        self.writer.add_figure("Eval/Confusion_Matrix", fig_cm, self.global_step)
+                    else:
+                        save_path = f"confusion_matrix_epoch_{self.display_epoch}.png"
+                        fig_cm.savefig(save_path)
+                        print(f"Confusion matrix saved to {save_path}")
+                    plt.close(fig_cm)
+
+                    # 打印 Per-Class Accuracy
+                    cm = confusion_matrix(all_trues, all_preds)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        per_class_acc = cm.diagonal() / cm.sum(axis=1)
+                        per_class_acc = np.nan_to_num(per_class_acc)
+                    
+                    print("-" * 40)
+                    print(f"{'Class':<15} | {'Accuracy':<10}")
+                    print("-" * 40)
+                    for i, acc in enumerate(per_class_acc):
+                        if i < len(self.classes):
+                            class_name = str(self.classes[i])
+                            print(f"Accuracy of {class_name:<15} : {100 * acc:.2f}%")
+                    print("-" * 40)
+                
+                # 2. ROC 曲线
+                if self.enable_roc_curve:
+                    all_scores = torch.cat(self.y_scores).numpy()
+                    fig_roc = plot_roc_curve(all_trues, all_scores, self.classes)
+                    if self.writer is not None:
+                        self.writer.add_figure("Eval/ROC_Curve", fig_roc, self.global_step)
+                    else:
+                        save_path = f"roc_curve_epoch_{self.display_epoch}.png"
+                        fig_roc.savefig(save_path)
+                        print(f"ROC curve saved to {save_path}")
+                    plt.close(fig_roc)
+
+                # 3. 打印 Top-k Accuracy
+                if self.top_k is not None:
+                    top_k_acc = self.correct_top_k_predictions / self.total_predictions
+                    print(f"Top-{self.top_k} Accuracy: {100 * top_k_acc:.2f}%")
+
+                # 清空列表以备下一次评估
+                self.y_preds = []
+                self.y_trues = []
+                self.y_scores = []
+
         return loss.item()
 
     def record_history(self, current_val_loss: float = None, current_val_acc: float = None):

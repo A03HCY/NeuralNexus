@@ -69,25 +69,10 @@ print(model)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-model_trainer = Trainer(model, 15, train_loader=train_loader, optimizer=optimizer)
-start_epoch = model_trainer.load_checkpoint('./checkpoints/conv_cifar10_model.pth').display_epoch
+model_trainer = Trainer(model, 15, train_loader=train_loader, test_loader=test_loader, optimizer=optimizer, criterion=criterion, checkpoint_path='./checkpoints/conv_cifar10_model.pth')
 
-for trainer in model_trainer.train():
-    logist = model.forward(trainer.data)
-    loss = criterion(logist, trainer.target)
-    trainer.update(loss)
-    if trainer.is_last_batch_in_epoch:
-        print(f'Epoch: {trainer.display_epoch}, Loss: {loss.item():.6f}')
-        trainer.save_checkpoint('./checkpoints/conv_cifar10_model.pth')
-
-correct = 0
-total = 0
-for trainer in model_trainer.eval(test_loader, tqdm_bar=True):
-    logist = model.forward(trainer.data)
-    _, predicted = torch.max(logist.data, 1)
-    total += trainer.target.size(0)
-    correct += (predicted == trainer.target).sum().item()
-
-print(f'Accuracy: {100 * correct / total:.2f}%')
+model_trainer.init_tensorboard()
+model_trainer.init_classes(classes)
+model_trainer.fit(cal_classification_metrics=True)
 
 model_trainer.save_model('./models/conv_cifar10_model.pth')
