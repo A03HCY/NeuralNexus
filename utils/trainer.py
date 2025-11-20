@@ -1162,7 +1162,7 @@ class Trainer:
         if cal_classification_metrics:
             for trainer in self.eval(test_loader, tqdm_bar=True):
                 trainer.calculate_classification_metrics()
-            print(f'Accuracy: {100 * self.eval_accuracy:.2f}%')
+            print(f'Mean Accuracy: {100 * self.eval_accuracy:.2f}%')
         
         return self
 

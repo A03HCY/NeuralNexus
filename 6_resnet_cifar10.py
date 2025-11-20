@@ -40,7 +40,7 @@ class ResClassify(nn.Module):
 model = ResClassify()
 model_trainer = Trainer(
     model=model,
-    num_epochs=20,
+    num_epochs=10,
     train_loader=train_loader,
     test_loader=test_loader,
     optimizer=torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4),
