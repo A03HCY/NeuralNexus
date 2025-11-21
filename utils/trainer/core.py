@@ -30,11 +30,6 @@ class Trainer:
     - **可视化**: 集成 TensorBoard 日志记录。
     - **易用性**: 自动处理设备移动、进度条显示 (tqdm) 和指标计算。
     - **高级功能**: 支持 EMA、DataParallel、推理预测 (Predict)。
-    Attributes:
-        model (nn.Module): 正在训练的模型。
-        device (torch.device): 当前运行设备。
-        history (Dict): 记录训练过程中的 loss 和 metric 历史。
-        global_step (int): 全局训练步数计数器。
     """
 
     def __init__(
@@ -536,15 +531,21 @@ class Trainer:
             print("LR Finder finished. Model state restored.")
 
         # 3. 绘图
-        plt.figure(figsize=(10, 6))
+        fig = plt.figure(figsize=(10, 6))
         plt.plot(lrs, losses)
         plt.xscale('log')
         plt.xlabel('Learning Rate')
         plt.ylabel('Loss')
         plt.title('Learning Rate Finder')
         plt.grid(True, which="both", ls="-", alpha=0.5)
+        
+        if self.writer is not None:
+            self.writer.add_figure('LR_Finder', fig, self.global_step)
+            print("Result saved to TensorBoard.")
+        
         plt.savefig('lr_finder_result.png')
         print("Result saved to 'lr_finder_result.png'.")
+        plt.close(fig)
 
     def _process_batch_data(self, batch_data: Any):
         """
