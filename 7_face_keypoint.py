@@ -67,8 +67,8 @@ class FaceKeyPoint(nn.Module):
         self.fc = nn.Sequential(
             nn.Flatten(),
             nn.Linear(512 * 8 * 8, 1024),
-            nn.ReLU(),
             nn.Dropout(0.5),
+            nn.ReLU(),
             nn.Linear(1024, num_classes),
         )
     
@@ -79,12 +79,12 @@ class FaceKeyPoint(nn.Module):
 
 model = FaceKeyPoint()
 criterion = nn.SmoothL1Loss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
 model_trainer = Trainer(
     model=model,
-    num_epochs=55,
+    num_epochs=50,
     train_loader=train_loader,
     test_loader=test_loader,
     optimizer=optimizer,
@@ -101,6 +101,7 @@ last_img, last_pred, last_target = None, None, None
 last_loss = 1
 
 for trainer in model_trainer.eval(tqdm_bar=True):
+    if not trainer.is_last_batch_in_epoch: continue
     if trainer.data.dim() == 3: trainer.data = trainer.data.unsqueeze(0)
     if trainer.target is not None and trainer.target.dim() == 1: trainer.target = trainer.target.unsqueeze(0)
     output: torch.Tensor = trainer.model.forward(trainer.data)

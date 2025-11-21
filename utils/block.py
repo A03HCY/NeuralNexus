@@ -1,6 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+def calculate_causal_layer(step:int, kernel_size:int=3):
+    if kernel_size <= 1:
+        raise ValueError("kernel_size must be greater than 1")
+    L = math.ceil(math.log2((step - 1) / (kernel_size - 1) + 1))
+    R = 1 + (kernel_size - 1) * (2 ** L - 1)
+    return int(L), R
+
 
 class ConvBlock(nn.Module):
     ''' 带有归一化和激活函数的基本卷积块。
@@ -187,7 +196,7 @@ class CausalConv1d(nn.Module):
         self.padding = (kernel_size - 1) * dilation
         self.use_res = use_res
         
-        self.conv = nn.utils.weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size, padding=0, dilation=dilation))
+        self.conv = nn.utils.parametrizations.weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size, padding=0, dilation=dilation))
         
         self.relu = nn.LeakyReLU(leaky_relu, inplace=True)
         self.dropout = nn.Dropout(dropout)
@@ -210,3 +219,15 @@ class CausalConv1d(nn.Module):
             x = x + residual
             
         return x
+    
+    @staticmethod
+    def auto_block(in_channels, out_channels, step, kernel_size=3, leaky_relu=0.1, use_res=True, dropout=0.2) -> nn.Sequential:
+        layers, _ = calculate_causal_layer(step, kernel_size)
+        model = []
+        for i in range(layers):
+            dilation = 2 ** i
+            in_ch = in_channels if i == 0 else out_channels
+
+            model.append(CausalConv1d(in_ch, out_channels, kernel_size, dilation, leaky_relu, use_res, dropout))
+
+        return nn.Sequential(*model)

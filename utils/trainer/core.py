@@ -216,8 +216,7 @@ class Trainer:
 
     def _display_model_summary(self):
         """
-        打印丰富的模型结构、环境信息及参数统计。
-        支持自动调用 torchinfo (如果已安装)。
+        打印环境信息及参数统计。
         """
         import sys
         
@@ -309,9 +308,6 @@ class Trainer:
                 log_dir = os.path.join("runs", f"{model_name}_{timestamp}")
             
             self.writer = SummaryWriter(log_dir=log_dir)
-            
-            # 记录模型名称
-            self.writer.add_text("Model/Name", model_name)
             
             print(f"TensorBoard initialized. Logs will be saved to: {log_dir}")
         except ImportError:
@@ -923,6 +919,186 @@ class Trainer:
 
         return loss.item()
 
+    def calculate_predict_regression_metrics(self, vis_forecast_steps: int = 50) -> float:
+        """
+        计算回归任务的 Loss，并在 Epoch 结束时进行自回归预测的可视化。
+        
+        Args:
+            vis_forecast_steps (int): 可视化时自回归预测的步数。
+        
+        Returns:
+            float: 当前 Batch 的 Loss。
+        """
+        # 1. Forward & Loss
+        with autocast(device_type=self.device.type, enabled=self.use_amp):
+            if isinstance(self.data, tuple):
+                logits = self.model(*self.data)
+            else:
+                logits = self.model(self.data)
+            
+            logits_squeezed = match_shape_if_needed(logits, self.target)
+            loss = self.criterion(logits_squeezed, self.target) if self.criterion else torch.tensor(0.0)
+
+        batch_size = self.target.size(0)
+        self.eval_loss += loss.item() * batch_size
+        self.total_predictions += batch_size
+        
+        # 2. Visualization (Last batch only)
+        if self.is_last_batch_in_epoch:
+            try:
+                self._plot_regression_forecast(vis_forecast_steps)
+            except Exception as e:
+                print(f"Warning: Failed to plot regression forecast: {e}")
+
+        return loss.item()
+
+    def _plot_regression_forecast(self, steps: int):
+        """
+        内部方法：执行自回归预测并绘图。
+        生成两张图：
+        1. Split Validation: 取数据的 2/3 作为历史，剩下的 1/3 作为 Ground Truth 进行对比。
+        2. Future Extension: 取全部数据作为历史，向后预测 steps 步。
+        """
+        # 获取第一个样本
+        if isinstance(self.data, tuple):
+            input_data = self.data[0]
+        else:
+            input_data = self.data
+            
+        if not isinstance(input_data, torch.Tensor):
+            return
+
+        # 原始完整序列: [1, L, ...]
+        full_seq = input_data[0:1].clone()
+        seq_len = full_seq.shape[1]
+        
+        # 准备 Ground Truth (用于绘图): 取完整序列的 numpy
+        full_seq_np = full_seq[0].detach().cpu().numpy()
+        if full_seq_np.ndim > 1:
+            full_seq_plot = full_seq_np[:, 0] # 取第一个特征
+        else:
+            full_seq_plot = full_seq_np
+
+        # Plot 1: Split Validation (2/3 vs 1/3)
+        split_idx = int(seq_len * 2 / 3)
+        if split_idx == 0: split_idx = 1
+        
+        curr_seq_split = full_seq[:, :split_idx].clone()
+        history_plot_split = full_seq_plot[:split_idx]
+        truth_plot_split = full_seq_plot[split_idx:]
+        pred_steps_split = len(truth_plot_split)
+        if pred_steps_split == 0: pred_steps_split = 1
+
+        forecasts_split = self._run_autoregressive(curr_seq_split, pred_steps_split)
+        
+        fig1, ax1 = plt.subplots(figsize=(10, 5))
+        x_hist_split = np.arange(len(history_plot_split))
+        x_fut_split = np.arange(len(history_plot_split), len(history_plot_split) + len(truth_plot_split))
+        
+        # History
+        ax1.plot(x_hist_split, history_plot_split, label='History', color='blue', linestyle='-')
+        # Ground Truth
+        if len(history_plot_split) > 0:
+            x_truth_conn = np.concatenate(([x_hist_split[-1]], x_fut_split))
+            y_truth_conn = np.concatenate(([history_plot_split[-1]], truth_plot_split))
+            ax1.plot(x_truth_conn, y_truth_conn, label='Ground Truth', color='green', linestyle='-')
+        else:
+            ax1.plot(x_fut_split, truth_plot_split, label='Ground Truth', color='green', linestyle='-')
+        # Forecast
+        if forecasts_split:
+            if len(history_plot_split) > 0:
+                x_fore_conn = np.concatenate(([x_hist_split[-1]], x_fut_split[:len(forecasts_split)]))
+                y_fore_conn = np.concatenate(([history_plot_split[-1]], forecasts_split))
+                ax1.plot(x_fore_conn, y_fore_conn, label='Forecast', color='red', linestyle='-')
+            else:
+                ax1.plot(x_fut_split[:len(forecasts_split)], forecasts_split, label='Forecast', color='red', linestyle='-')
+        
+        ax1.axvline(x=len(history_plot_split)-1, color='gray', linestyle='--', alpha=0.5, label='Split Point')
+        ax1.set_title(f'Validation Split (Epoch {self.display_epoch})')
+        ax1.set_xlabel('Time Step')
+        ax1.set_ylabel('Value')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if self.writer is not None:
+            self.writer.add_figure('Eval/Forecast_Split', fig1, self.global_step)
+        else:
+            fig1.savefig(f"forecast_split_epoch_{self.display_epoch}.png")
+        plt.close(fig1)
+
+        # Plot 2: Future Extension (Full + steps)
+        curr_seq_full = full_seq.clone()
+        forecasts_future = self._run_autoregressive(curr_seq_full, steps)
+        
+        fig2, ax2 = plt.subplots(figsize=(10, 5))
+        x_hist_full = np.arange(len(full_seq_plot))
+        x_fut_full = np.arange(len(full_seq_plot), len(full_seq_plot) + steps)
+        
+        # History (Full)
+        ax2.plot(x_hist_full, full_seq_plot, label='History (Full)', color='blue', linestyle='-')
+        # Forecast
+        if forecasts_future:
+            x_fore_conn = np.concatenate(([x_hist_full[-1]], x_fut_full))
+            y_fore_conn = np.concatenate(([full_seq_plot[-1]], forecasts_future))
+            ax2.plot(x_fore_conn, y_fore_conn, label=f'Future Forecast ({steps} steps)', color='purple', linestyle='--')
+            
+        ax2.axvline(x=len(full_seq_plot)-1, color='gray', linestyle='--', alpha=0.5, label='Start of Future')
+        ax2.set_title(f'Future Extension (Epoch {self.display_epoch})')
+        ax2.set_xlabel('Time Step')
+        ax2.set_ylabel('Value')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if self.writer is not None:
+            self.writer.add_figure('Eval/Forecast_Future', fig2, self.global_step)
+        else:
+            fig2.savefig(f"forecast_future_epoch_{self.display_epoch}.png")
+        plt.close(fig2)
+
+    def _run_autoregressive(self, initial_seq: torch.Tensor, steps: int) -> List[float]:
+        """辅助方法：执行自回归预测循环"""
+        curr_seq = initial_seq.clone()
+        forecasts = []
+        self.model.eval()
+        
+        with torch.no_grad():
+            for _ in range(steps):
+                with autocast(device_type=self.device.type, enabled=self.use_amp):
+                    if isinstance(self.data, tuple):
+                        inputs = (curr_seq,) + tuple(d[0:1] for d in self.data[1:])
+                        pred = self.model(*inputs)
+                    else:
+                        pred = self.model(curr_seq)
+                
+                pred_val = pred.detach().cpu().numpy()[0]
+                if pred_val.ndim > 0:
+                    val = pred_val.item() if pred_val.size == 1 else pred_val[0]
+                else:
+                    val = pred_val.item()
+                forecasts.append(val)
+                
+                if curr_seq.ndim >= 2:
+                    if pred.ndim == curr_seq.ndim:
+                        new_part = pred
+                    elif pred.ndim == curr_seq.ndim - 1:
+                        new_part = pred.unsqueeze(1)
+                    else:
+                        if curr_seq.ndim == 3 and pred.ndim == 2:
+                             new_part = pred.unsqueeze(1)
+                        else:
+                             break
+                    try:
+                        curr_seq = torch.cat([curr_seq[:, 1:], new_part], dim=1)
+                    except RuntimeError:
+                        break
+                else:
+                    break
+        
+        self.model.train()
+        return forecasts
+
     def record_history(self, current_val_loss: float = None, current_val_acc: float = None):
         """
         手动将验证集指标添加到 history 字典中。
@@ -1030,15 +1206,19 @@ class Trainer:
             train_loader: Optional[DataLoader] = None,
             test_loader: Optional[DataLoader] = None,
             cal_classification_metrics: bool = False,
+            cal_predict_regression_metrics: bool = False,
+            vis_forecast_steps: int = 50,
         ) -> 'Trainer':
         """
         傻瓜式训练器。
-        支持自动更新、自动保存检查点、自动计算分类指标。
+        支持自动更新、自动保存检查点、自动计算分类/回归指标。
         
         Args:
             train_loader (Optional[DataLoader]): 训练数据加载器。
             test_loader (Optional[DataLoader]): 测试数据加载器。
             cal_classification_metrics (bool): 是否计算分类指标。
+            cal_predict_regression_metrics (bool): 是否计算回归指标并绘图。
+            vis_forecast_steps (int): 回归任务中自回归预测的步数。
             
         Returns:
             self (Trainer): 训练器对象，用于链式调用。
@@ -1055,6 +1235,11 @@ class Trainer:
             for trainer in self.eval(test_loader, tqdm_bar=True):
                 trainer.calculate_classification_metrics()
             print(f'Mean Accuracy: {100 * self.eval_accuracy:.2f}%')
+            
+        if cal_predict_regression_metrics:
+            for trainer in self.eval(test_loader, tqdm_bar=True):
+                trainer.calculate_predict_regression_metrics(vis_forecast_steps=vis_forecast_steps)
+            print(f'Mean Loss: {self.eval_loss / self.total_predictions:.6f}')
         
         return self
 
