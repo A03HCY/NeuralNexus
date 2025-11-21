@@ -1,10 +1,7 @@
 import os
 import copy
-import random
-import time
 import datetime
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,184 +11,12 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 from torch.utils.data import DataLoader
 from typing import Any, Generator, Iterator, Optional, Dict, List, Union, Tuple
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, roc_curve, auc
-from sklearn.preprocessing import label_binarize
-from itertools import cycle
+from sklearn.metrics import confusion_matrix
 
-def plot_confusion_matrix(y_true, y_pred, class_names=None):
-    """
-    绘制混淆矩阵并返回 matplotlib figure 对象。
-    """
-    cm = confusion_matrix(y_true, y_pred)
-    fig, ax = plt.subplots(figsize=(10, 10))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=class_names if class_names else "auto",
-                yticklabels=class_names if class_names else "auto")
-    plt.ylabel('Actual')
-    plt.xlabel('Predicted')
-    plt.tight_layout()
-    return fig
-
-def plot_roc_curve(y_true, y_score, class_names=None):
-    """
-    绘制 ROC 曲线并返回 matplotlib figure 对象。
-    支持二分类和多分类 (One-vs-Rest)。
-    """
-    n_classes = len(class_names) if class_names else (y_score.shape[1] if y_score.ndim > 1 else 2)
-    
-    fig, ax = plt.subplots(figsize=(10, 10))
-    
-    # 二分类情况 (y_score shape [N, 1] or [N])
-    if n_classes == 2 or (y_score.ndim == 1) or (y_score.shape[1] == 1):
-        # 假设 y_score 是正类的概率
-        # 如果 y_score 是 [N, 1]，squeeze
-        if y_score.ndim == 2: y_score = y_score.squeeze()
-        
-        fpr, tpr, _ = roc_curve(y_true, y_score)
-        roc_auc = auc(fpr, tpr)
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
-    else:
-        # 多分类情况
-        # 需要将 y_true 二值化
-        y_true_bin = label_binarize(y_true, classes=range(n_classes))
-        
-        # 计算每一类的 ROC
-        fpr = dict()
-        tpr = dict()
-        roc_auc = dict()
-        for i in range(n_classes):
-            fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_score[:, i])
-            roc_auc[i] = auc(fpr[i], tpr[i])
-            
-        # 绘制微平均 ROC 曲线 (Micro-average)
-        fpr["micro"], tpr["micro"], _ = roc_curve(y_true_bin.ravel(), y_score.ravel())
-        roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
-        
-        plt.plot(fpr["micro"], tpr["micro"],
-                 label=f'micro-average ROC curve (area = {roc_auc["micro"]:.2f})',
-                 color='deeppink', linestyle=':', linewidth=4)
-
-        # 绘制每一类的 ROC 曲线
-        colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'green', 'red', 'purple'])
-        for i, color in zip(range(n_classes), colors):
-            label = f'ROC curve of class {class_names[i] if class_names else i}'
-            label += f' (area = {roc_auc[i]:.2f})'
-            plt.plot(fpr[i], tpr[i], color=color, lw=2, label=label)
-
-    plt.plot([0, 1], [0, 1], 'k--', lw=2)
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic (ROC)')
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    return fig
-
-def check_sanity(loss: torch.Tensor, step: int):
-    if torch.isnan(loss) or torch.isinf(loss):
-        print(f"CRITICAL WARNING: Loss became NaN or Inf at step {step}!")
-        return False
-    return True
-
-def set_seed(seed: int = 42):
-    """
-    固定随机种子以保证实验的可复现性。
-    
-    包括 random, numpy, torch 以及 cuda 的种子设置。
-    注意：设置 cudnn.deterministic = True 可能会降低训练速度。
-
-    Args:
-        seed (int): 随机种子数值。
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # 确保 CUDA 选择确定性算法
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    print(f"Random seed set to {seed}")
-
-def match_shape_if_needed(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
-    检查张量 a 是否需要调整形状以匹配 b。
-    
-    常用于处理 Binary Cross Entropy 中预测值 [N, 1] 与 目标值 [N] 不匹配的情况。
-
-    Args:
-        a (torch.Tensor): 预测张量或源张量。
-        b (torch.Tensor): 目标张量。
-
-    Returns:
-        torch.Tensor: 调整形状后的张量 a。
-    """
-    if a.dim() == 2 and b.dim() == 1 and a.shape[0] == 1 and a.shape[1] == b.shape[0]:
-        return a.squeeze(0)
-    if a.dim() == 2 and b.dim() == 1 and a.shape[1] == 1 and a.shape[0] == b.shape[0]:
-         return a.squeeze(1)
-    return a
-
-class TimingContext:
-    def __init__(self, name="Block"):
-        self.name = name
-
-    def __enter__(self):
-        self.start = time.time()
-        torch.cuda.synchronize() # 如果用 GPU，必须同步才能测准
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        torch.cuda.synchronize()
-        print(f"[{self.name}] elapsed: {(time.time() - self.start)*1000:.2f} ms")
-
-class Timer:
-    def __init__(self):
-        self.start_time = time.time()
-        self.epoch_start_time = 0
-    
-    def start_epoch(self):
-        self.epoch_start_time = time.time()
-        
-    def end_epoch(self) -> str:
-        elapsed = time.time() - self.epoch_start_time
-        return str(datetime.timedelta(seconds=int(elapsed)))
-    
-    def total_time(self) -> str:
-        elapsed = time.time() - self.start_time
-        return str(datetime.timedelta(seconds=int(elapsed)))
-
-class ModelEMA:
-    """
-    模型权重的指数移动平均 (Exponential Moving Average)。
-    """
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = decay
-        # 创建影子模型 (Shadow Model)，只保存权重，不参与反向传播
-        self.shadow = copy.deepcopy(model.module if hasattr(model, 'module') else model)
-        self.shadow.eval()
-        # 将参数设为不需要梯度，节省显存
-        for param in self.shadow.parameters():
-            param.requires_grad = False
-    def update(self, model: nn.Module):
-        """根据当前模型参数更新影子参数"""
-        # 兼容 DataParallel
-        model_to_use = model.module if hasattr(model, 'module') else model
-        
-        with torch.no_grad():
-            msd = model_to_use.state_dict()
-            for name, param in self.shadow.named_parameters():
-                if name in msd:
-                    new_param = msd[name]
-                    # 确保设备一致
-                    if param.device != new_param.device:
-                         param.data = param.data.to(new_param.device)
-                    # EMA 公式: shadow = decay * shadow + (1 - decay) * new_param
-                    param.data.mul_(self.decay).add_(new_param.data, alpha=1 - self.decay)
-    def apply_shadow(self, model: nn.Module):
-        """将 EMA 权重赋值给原模型 (通常在推理或保存最佳模型前使用)"""
-        model_to_use = model.module if hasattr(model, 'module') else model
-        model_to_use.load_state_dict(self.shadow.state_dict())
+from .visualization import plot_confusion_matrix, plot_roc_curve
+from .utils import check_sanity, match_shape_if_needed
+from .timer import Timer
+from .ema import ModelEMA
 
 class Trainer:
     """
@@ -286,6 +111,7 @@ class Trainer:
         self.start_epoch: int = 0
         self.batch_idx: int = 0
         self.global_step: int = 0  # 记录总的 optimizer step 次数 (batch数)
+        self.state_dict = {}
         
         # 当前 Batch 的数据
         self.data: Optional[Union[torch.Tensor, Tuple[torch.Tensor]]] = None
@@ -495,6 +321,71 @@ class Trainer:
             print(f"TensorBoard initialized. Logs will be saved to: {log_dir}")
         except ImportError:
             print("Warning: TensorBoard not found. Install it using 'pip install tensorboard'.")
+        finally:
+            return self
+
+    def preview_data(self) -> 'Trainer':
+        """
+        尝试从 train_loader 获取一个 batch 并记录到 TensorBoard。
+        支持图像数据 (make_grid) 和 简单 1D 回归数据 (scatter plot)。
+        """
+        if self.writer is None or self.train_loader is None:
+            return
+
+        try:
+            # 获取一个 batch
+            batch = next(iter(self.train_loader))
+            
+            inputs = None
+            targets = None
+            
+            # 解析 batch
+            if isinstance(batch, (list, tuple)):
+                if len(batch) >= 2:
+                    inputs = batch[0]
+                    targets = batch[1]
+                else:
+                    inputs = batch[0]
+            else:
+                inputs = batch
+            
+            # 1. 图像数据处理 (B, C, H, W)
+            if isinstance(inputs, torch.Tensor) and inputs.ndim == 4:
+                try:
+                    import torchvision
+                    # 取前 32 张图片
+                    num_images = min(inputs.size(0), 32)
+                    # normalize=True 会将图像归一化到 (0, 1) 用于显示
+                    img_grid = torchvision.utils.make_grid(inputs[:num_images], normalize=True)
+                    self.writer.add_image('Data/Preview_Images', img_grid, 0)
+                except ImportError:
+                    pass
+            
+            # 2. 简单的 X-Y 关系图 (如果数据是低维的)
+            # 适用于回归任务，例如 inputs: [N, 1], targets: [N, 1]
+            elif isinstance(inputs, torch.Tensor) and isinstance(targets, torch.Tensor):
+                x = inputs.detach().cpu().numpy()
+                y = targets.detach().cpu().numpy()
+                
+                # 尝试 squeeze
+                x = np.squeeze(x)
+                y = np.squeeze(y)
+                
+                # 只有当 x 和 y 都是 1D 数组且长度相等时才绘制散点图
+                if x.ndim == 1 and y.ndim == 1 and x.shape == y.shape:
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    ax.scatter(x, y, alpha=0.5)
+                    ax.set_xlabel('Input')
+                    ax.set_ylabel('Target')
+                    ax.set_title('Data Preview (Scatter)')
+                    plt.tight_layout()
+                    
+                    self.writer.add_figure('Data/Preview_Scatter', fig, 0)
+                    plt.close(fig)
+
+        except Exception as e:
+            print(f"Warning: Failed to preview data: {e}")
+        
         finally:
             return self
 
@@ -1190,7 +1081,8 @@ class Trainer:
             'history': self.history,
             'best_val_metric': self.best_val_metric,
             'patience_counter': self.patience_counter,
-            'best_metric_for_es': self.best_metric_for_es
+            'best_metric_for_es': self.best_metric_for_es,
+            'state_dict': self.state_dict,
         }
         if extra_info:
             state.update(extra_info)
@@ -1234,6 +1126,8 @@ class Trainer:
             self.best_val_metric = checkpoint.get('best_val_metric', -float('inf'))
             self.patience_counter = checkpoint.get('patience_counter', 0)
             self.best_metric_for_es = checkpoint.get('best_metric_for_es', None)
+            temp_state_dict = checkpoint.get('state_dict', {})
+            self.state_dict.update(temp_state_dict)
             
             print(f"Resumed from Epoch {self.display_epoch - 1} (Global Step: {self.global_step}).")
         except Exception as e:

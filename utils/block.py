@@ -178,3 +178,35 @@ class ResBottleneckBlock(nn.Module):
         x = x + residual
         x = self.relu(x)
         return x
+
+
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, leaky_relu=0.1, use_res=True, dropout=0.2):
+        super(CausalConv1d, self).__init__()
+        
+        self.padding = (kernel_size - 1) * dilation
+        self.use_res = use_res
+        
+        self.conv = nn.utils.weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size, padding=0, dilation=dilation))
+        
+        self.relu = nn.LeakyReLU(leaky_relu, inplace=True)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.downsample = None
+        if use_res and in_channels != out_channels:
+            self.downsample = nn.Conv1d(in_channels, out_channels, 1, padding=0)
+
+    def forward(self, x):
+        residual = x
+        x = F.pad(x, (self.padding, 0))
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        
+        if self.use_res:
+            if self.downsample is not None:
+                residual = self.downsample(residual)
+            
+            x = x + residual
+            
+        return x
