@@ -83,7 +83,7 @@ class DoubleConvBlock(nn.Module):
 class DownsampleBlock(nn.Module):
     ''' 使用带步长的 ConvBlock 或 DoubleConvBlock 进行下采样块。
     '''
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, stride: int = 2, leaky_relu: float = 0.1, act: bool = True, use_double_conv: bool = False, maxpool: bool = True, dropout_prob: float = 0.0):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, stride: int = 2, leaky_relu: float = 0.1, act: bool = True, use_double_conv: bool = True, maxpool: bool = True, dropout_prob: float = 0.0, return_features: bool = True):
         ''' 初始化 DownsampleBlock。
 
         Args:
@@ -94,11 +94,13 @@ class DownsampleBlock(nn.Module):
             stride (int): 卷积步长。默认为 2。
             leaky_relu (float): LeakyReLU 的负斜率。默认为 0.1。
             act (bool): 是否使用激活函数。默认为 True。
-            use_double_conv (bool): 是否使用双卷积块。默认为 False。
+            use_double_conv (bool): 是否使用双卷积块。默认为 True。
             maxpool (bool): 是否使用 MaxPool2d(2) 进行下采样。默认为 True。
             dropout_prob (float): Dropout 概率。默认为 0.0。
+            return_features (bool): 是否返回中间特征（池化前）。默认为 True。
         '''
         super(DownsampleBlock, self).__init__()
+        self.return_features = return_features
         
         conv_stride = 1 if maxpool else stride
         
@@ -120,16 +122,20 @@ class DownsampleBlock(nn.Module):
             torch.Tensor: 输出张量。
         '''
         x = self.block(x)
+        features = x
         if self.maxpool is not None:
             x = self.maxpool(x)
         if self.dropout is not None:
             x = self.dropout(x)
+        
+        if self.return_features:
+            return x, features
         return x
 
 class UpsampleBlock(nn.Module):
     ''' 使用转置卷积后接 ConvBlock 或 DoubleConvBlock 的上采样块。
     '''
-    def __init__(self, in_ch: int, out_ch: int, scale_factor: int = 2, leaky_relu: float = 0.1, use_double_conv: bool = False, use_skip: bool = False):
+    def __init__(self, in_ch: int, out_ch: int, scale_factor: int = 2, leaky_relu: float = 0.1, use_double_conv: bool = True, use_skip: bool = True):
         ''' 初始化 UpsampleBlock。
 
         Args:
@@ -137,8 +143,8 @@ class UpsampleBlock(nn.Module):
             out_ch (int): 输出通道数。
             scale_factor (int): 空间大小的乘数。默认为 2。
             leaky_relu (float): LeakyReLU 的负斜率。默认为 0.1。
-            use_double_conv (bool): 是否使用双卷积块。默认为 False。
-            use_skip (bool): 是否使用跳跃连接。默认为 False。
+            use_double_conv (bool): 是否使用双卷积块。默认为 True。
+            use_skip (bool): 是否使用跳跃连接。默认为 True。
         '''
         super(UpsampleBlock, self).__init__()
         self.use_skip = use_skip
