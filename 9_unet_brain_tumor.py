@@ -1,8 +1,15 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from utils.block import DoubleConvBlock, DownsampleBlock, UpsampleBlock
+from data.brain_tumor import train_dataset, valid_dataset, test_dataset
+from utils.trainer import Trainer
 
+batch_size = 4
 
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 
 class UNet(nn.Module):
@@ -36,6 +43,7 @@ class UNet(nn.Module):
 
         # Output layer
         self.outc = nn.Conv2d(64, out_ch, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ''' 前向传播。
@@ -64,23 +72,22 @@ class UNet(nn.Module):
         x = self.up4(x, f1) # 128 -> 64 ch
 
         # Output
-        logits = self.outc(x)
+        out = self.outc(x)
+        logits = self.sigmoid(out)
         return logits
 
-if __name__ == "__main__":
-    # 测试模型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNet(in_ch=3, out_ch=1).to(device)
-    
-    # 创建随机输入
-    x = torch.randn(1, 3, 256, 256).to(device)
-    
-    # 前向传播
-    y = model(x)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {y.shape}")
-    
-    # 验证输出尺寸是否与输入一致
-    assert x.shape[2:] == y.shape[2:], "Output spatial dimensions do not match input!"
-    print("Test passed: Output dimensions match input dimensions.")
+model = UNet()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.BCELoss()
+
+model_trainer = Trainer(
+    model=model,
+    num_epochs=10,
+    train_loader=train_loader,
+    test_loader=valid_loader,
+    optimizer=optimizer,
+    criterion=criterion,
+)
+
+model_trainer.init_tensorboard(log_dir='runs/brain_tumor')
+model_trainer.fit()

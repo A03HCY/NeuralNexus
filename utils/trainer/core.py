@@ -344,8 +344,8 @@ class Trainer:
             if isinstance(inputs, torch.Tensor) and inputs.ndim == 4:
                 try:
                     import torchvision
-                    # 取前 32 张图片
-                    num_images = min(inputs.size(0), 32)
+                    # 取前 8 张图片
+                    num_images = min(inputs.size(0), 8)
                     # normalize=True 会将图像归一化到 (0, 1) 用于显示
                     img_grid = torchvision.utils.make_grid(inputs[:num_images], normalize=True)
                     self.writer.add_image('Data/Preview_Images', img_grid, 0)
