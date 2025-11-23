@@ -1,6 +1,13 @@
-from data.brain_tumor import train_dataset, valid_dataset, test_dataset, path
+from data.lang import *
+from torch.utils.data import DataLoader
 
-print(path)
-print(next(iter(train_dataset)))
+eng, fra, data = load_data('./data/eng_fra.txt', 'eng', 'fra')
 
-'C:/Users/acdph/.cache/kagglehub/datasets/pkdarabi/brain-tumor-image-dataset-semantic-segmentation/versions/1/train'
+dataset = TwoLangDataset(data, eng, fra)
+
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=tld_collate_fn)
+
+for src, tgt in dataloader:
+    print("Source shape:", src.shape) # [32, max_len_src]
+    print("Target shape:", tgt.shape) # [32, max_len_tgt]
+    

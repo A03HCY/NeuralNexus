@@ -135,6 +135,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         
         # 5. 增加 Batch 维度: [1, max_len, d_model]
+        pe = pe.unsqueeze(0)
         # register_buffer 意味着这不是可训练参数，但会随模型 state_dict 保存
         self.register_buffer('pe', pe)
 
@@ -272,11 +273,13 @@ class Transformer(nn.Module):
         src_mask = create_src_mask(enc_input)
         tgt_mask = create_tgt_mask(dec_input)
 
+        # enc_input: [B, seq_len]
+        # dec_input: [B, seq_len]
         enc_output = self.encoder_forward(enc_input, src_mask)
         dec_output = self.decoder_forward(dec_input, enc_output, src_mask, tgt_mask)
 
         logits = self.ffn(dec_output)
-        return logits
+        return logits # [B, seq_len, dec_vocab_size]
 
 class ConvBlock(nn.Module):
     ''' 带有归一化和激活函数的基本卷积块。
