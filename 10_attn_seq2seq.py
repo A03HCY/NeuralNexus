@@ -203,3 +203,16 @@ for epoch in range(EPOCHS):
         torch.save(model.state_dict(), f'transformer_epoch_{epoch+1}.pth')
 
 print("Training Finished!")
+
+
+'''
+------------------------------
+ Src: I love cats.
+ Pred: j adore les chats .
+ Src: He is a good student.
+ Pred: c est un bon etudiant .
+ Src: Where are you going?
+ Pred: ou vas tu ?
+------------------------------
+Epoch: 3 | Time: 122.81s | Train Loss: 2.3691
+'''
