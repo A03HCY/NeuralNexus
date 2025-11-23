@@ -10,6 +10,273 @@ def calculate_causal_layer(step:int, kernel_size:int=3):
     R = 1 + (kernel_size - 1) * (2 ** L - 1)
     return int(L), R
 
+def apply_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    ''' 应用注意力机制 (Scaled Dot-Product Attention)。
+    公式: Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
+
+    Args:
+        Q: 查询张量。Shape: [... , L_q, D]
+        K: 键张量。  Shape: [... , L_k, D]
+        V: 值张量。  Shape: [... , L_k, D] (通常 K 和 V 的长度是一样的)
+        mask: 掩码。 Shape: [B, 1, 1, L_k] 或 [B, 1, L_q, L_k] (用于广播)
+    '''
+    
+    # 1. 获取缩放因子
+    d_k = math.sqrt(Q.size(-1)) 
+    # 2. 计算注意力分数 (QK^T)
+    # Q: [..., L_q, D]
+    # K: [..., L_k, D]
+    # K.transpose(-2, -1): 交换最后两个维度 -> [..., D, L_k]
+    # torch.matmul 会自动识别最后两个维度做矩阵乘法，前面的维度 (...) 视为 Batch 处理
+    # 运算: [..., L_q, D] @ [..., D, L_k] -> D 被消掉
+    q_k = torch.matmul(Q, K.transpose(-2, -1))
+    # q_k Shape: [..., L_q, L_k]  <-- 注意力分数矩阵
+    # 3. 缩放 (Scaling)
+    # Shape 不变: [..., L_q, L_k]
+    scores = q_k / d_k
+    # 4. 掩码 (Masking)
+    if mask is not None:
+        # mask == 0 的位置通常表示 Padding 或者未来的词
+        # 将这些位置填入 -1e9 (负无穷)，这样 softmax 后概率会趋近于 0
+        # mask 的形状必须能广播到 scores 的形状
+        scores = scores.masked_fill(mask == 0, -1e9)
+    # 5. 归一化 (Softmax)
+    # dim=-1 表示在最后一个维度 (L_k) 上进行 softmax
+    # 在最后一个维度 (L_k) 上归一化，表示 Query 对所有 Key 的关注度总和为 1
+    # attn Shape: [..., L_q, L_k]
+    attn = torch.softmax(scores, dim=-1)
+    # 6. 加权求和 (Attention * V)
+    # attn: [..., L_q, L_k]
+    # V:    [..., L_k, D]
+    # 运算: [..., L_q, L_k] @ [..., L_k, D] -> L_k 被消掉
+    # 返回 Shape: [..., L_q, D] 
+    # 保持与输入 Q 的形状一致
+    output = torch.matmul(attn, V)
+    return output
+
+def create_src_mask(src: torch.Tensor, pad_idx:int=0) -> torch.Tensor:
+    ''' 创建源序列掩码。
+    
+    Args:
+        src: 源序列张量。形状为 [B, L_src]
+        pad_idx: 填充符号的索引。默认为 0
+    
+    Returns:
+        mask: 源序列掩码。形状为 [B, 1, 1, L_src]
+    '''
+    mask = (src != pad_idx).unsqueeze(1).unsqueeze(2)
+    return mask
+
+def create_tgt_mask(tgt: torch.Tensor, pad_idx:int=0) -> torch.Tensor:
+    ''' 创建目标序列掩码。
+    
+    Args:
+        tgt: 目标序列张量。形状为 [B, L_tgt]
+        pad_idx: 填充符号的索引。默认为 0
+        
+    Returns:
+        mask: 目标序列掩码。形状为 [B, 1, L_tgt, L_tgt]
+    '''
+    pad_mask = (tgt != pad_idx).unsqueeze(1).unsqueeze(2)
+    seq_len = tgt.size(1)
+    lookahead_mask = torch.tril(torch.ones((seq_len, seq_len), device=tgt.device)).bool()
+
+    mask = pad_mask & lookahead_mask
+    return mask
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, head_num:int, model_dim:int):
+        super(MultiHeadAttention, self).__init__()
+        assert model_dim % head_num == 0
+        self.head_num = head_num
+        self.model_dim = model_dim
+        self.head_dim = model_dim // head_num
+        self.W_Q = nn.Linear(model_dim, model_dim)
+        self.W_K = nn.Linear(model_dim, model_dim)
+        self.W_V = nn.Linear(model_dim, model_dim)
+        self.W_O = nn.Linear(model_dim, model_dim)
+    
+    def forward(self, Q, K, V, mask=None):
+        batch_size = Q.size(0)
+        
+        # 1. 线性变换 + 分头
+        # [B, L, D] -> [B, L, Head, Head_Dim] -> [B, Head, L, Head_Dim]
+        Q = self.W_Q(Q).view(batch_size, -1, self.head_num, self.head_dim).transpose(1, 2)
+        K = self.W_K(K).view(batch_size, -1, self.head_num, self.head_dim).transpose(1, 2)
+        V = self.W_V(V).view(batch_size, -1, self.head_num, self.head_dim).transpose(1, 2)
+        # 2. 计算 Attention (保持4D形状，利用广播处理Mask)
+        output = apply_attention(Q, K, V, mask)
+        
+        # 3. 合并头
+        # [B, Head, L, Head_Dim] -> [B, L, Head, Head_Dim] -> [B, L, D]
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.model_dim)
+        
+        output = self.W_O(output)
+        return output
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        
+        # 1. 初始化矩阵: [max_len, d_model] (例如 [5000, 512])
+        pe = torch.zeros(max_len, d_model)
+        
+        # 2. 生成位置索引向量: [0, 1, ... 4999] -> [5000, 1]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        
+        # 3. 计算分母项 div_term (控制频率)
+        # 这是一个从 1 到 10000 的几何级数衰减
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        # 4. 填充矩阵
+        # 偶数位(0, 2, 4...)填 sin
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # 奇数位(1, 3, 5...)填 cos
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # 5. 增加 Batch 维度: [1, max_len, d_model]
+        # register_buffer 意味着这不是可训练参数，但会随模型 state_dict 保存
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        输入 x: [Batch_Size, Seq_Len, d_model]
+        """
+        # 6. 切片与相加
+        # self.pe 是 [1, 5000, 512]
+        # x.size(1) 是当前句子的实际长度 (比如 10)
+        # 取出前 10 个位置编码: [1, 10, 512]
+        # 利用广播机制加到 x 上
+        x = x + self.pe[:, :x.size(1), :]
+        return x
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, model_dim, ff_dim):
+        super(PositionwiseFeedForward, self).__init__()
+        # model_dim 通常是 512
+        # ff_dim (中间层维度) 通常是 2048 (4倍大小)
+        
+        # 第一层: 扩维 [512 -> 2048]
+        self.fc1 = nn.Linear(model_dim, ff_dim)
+        
+        # 第二层: 降维 [2048 -> 512]
+        self.fc2 = nn.Linear(ff_dim, model_dim)
+        
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x 的 shape: [Batch_Size, Seq_Len, d_model]
+        
+        # 1. 线性投影 1
+        # PyTorch 的 Linear 层只会作用于最后一维
+        # [B, S, 512] -> [B, S, 2048]
+        x = self.fc1(x)
+        
+        # 2. 激活函数
+        # [B, S, 2048] (负数变0)
+        x = self.relu(x)
+        
+        # 3. 线性投影 2
+        # [B, S, 2048] -> [B, S, 512]
+        x = self.fc2(x)
+        return x
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, model_dim, head_num, ff_dim, dropout=0.1):
+        super(TransformerEncoder, self).__init__()
+
+        self.self_attn = MultiHeadAttention(head_num, model_dim)
+        self.norm1 = nn.LayerNorm(model_dim)
+
+        self.pos_ffn = PositionwiseFeedForward(model_dim, ff_dim)
+        self.norm2 = nn.LayerNorm(model_dim)
+
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, mask=None):
+        attn = self.self_attn(x, x, x, mask)
+        attn = self.dropout(attn)
+        x = self.norm1(x + attn)
+
+        ffn = self.pos_ffn(x)
+        ffn = self.dropout(ffn)
+        x = self.norm2(x + ffn)
+        return x
+    
+class TransformerDecoder(nn.Module):
+    def __init__(self, model_dim, head_num, ff_dim, dropout=0.1):
+        super(TransformerDecoder, self).__init__()
+
+        self.self_attn = MultiHeadAttention(head_num, model_dim)
+        self.norm1 = nn.LayerNorm(model_dim)
+
+        self.cross_attn = MultiHeadAttention(head_num, model_dim)
+        self.norm2 = nn.LayerNorm(model_dim)
+
+        self.pos_ffn = PositionwiseFeedForward(model_dim, ff_dim)
+        self.norm3 = nn.LayerNorm(model_dim)
+
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, enc_output, enc_mask, dec_mask):
+        attn = self.self_attn(x, x, x, dec_mask)
+        attn = self.dropout(attn)
+        x = self.norm1(attn + x)
+
+        cros = self.cross_attn(x, enc_output, enc_output, enc_mask)
+        cros = self.dropout(cros)
+        x = self.norm2(cros + x)
+
+        ffn = self.pos_ffn(x)
+        ffn = self.dropout(ffn)
+        x = self.norm3(ffn + x)
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, model_dim, head_num, layer_num, ff_dim, enc_vocab_size, dec_vocab_size, max_len=5000, dropout=0.1):
+        super(Transformer, self).__init__()
+        self.model_dim = model_dim
+        self.head_num = head_num
+
+        self.encoder_embedding = nn.Embedding(enc_vocab_size, model_dim)
+        self.decoder_embedding = nn.Embedding(dec_vocab_size, model_dim)
+
+        self.pe = PositionalEncoding(model_dim, max_len)
+
+        self.encoder = nn.ModuleList([TransformerEncoder(model_dim, head_num, ff_dim, dropout) for _ in range(layer_num)])
+        self.decoder = nn.ModuleList([TransformerDecoder(model_dim, head_num, ff_dim, dropout) for _ in range(layer_num)])
+
+        self.ffn = nn.Linear(model_dim, dec_vocab_size)
+        self.dropout = nn.Dropout(dropout)
+    
+    def encoder_forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+        x = self.encoder_embedding(x) * math.sqrt(self.model_dim)
+        x = self.pe(x)
+
+        for layer in self.encoder:
+            x = layer(x, mask)
+        
+        return x # [B, seq_len, model_dim]
+    
+    def decoder_forward(self, x: torch.Tensor, enc_output: torch.Tensor, enc_mask: torch.Tensor, dec_mask: torch.Tensor) -> torch.Tensor:
+        x = self.decoder_embedding(x) * math.sqrt(self.model_dim)
+        x = self.pe(x)
+
+        for layer in self.decoder:
+            x = layer(x, enc_output, enc_mask, dec_mask)
+        
+        return x # [B, seq_len, model_dim]
+    
+    def forward(self, enc_input: torch.Tensor, dec_input: torch.Tensor) -> torch.Tensor:
+        src_mask = create_src_mask(enc_input)
+        tgt_mask = create_tgt_mask(dec_input)
+
+        enc_output = self.encoder_forward(enc_input, src_mask)
+        dec_output = self.decoder_forward(dec_input, enc_output, src_mask, tgt_mask)
+
+        logits = self.ffn(dec_output)
+        return logits
 
 class ConvBlock(nn.Module):
     ''' 带有归一化和激活函数的基本卷积块。

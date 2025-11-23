@@ -1,8 +1,12 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
 from utils.block import DoubleConvBlock, DownsampleBlock, UpsampleBlock
-from data.brain_tumor import train_dataset, valid_dataset, test_dataset
+from data.brain_tumor import train_dataset, valid_dataset, test_dataset, test_path
 from utils.trainer import Trainer
 
 batch_size = 1
@@ -92,3 +96,47 @@ model_trainer = Trainer(
 
 model_trainer.init_tensorboard(log_dir='runs/brain_tumor').preview_data()
 model_trainer.fit()
+
+def preprocess_image(image_path):
+    image = Image.open(image_path).convert('RGB')
+
+    display_image = image.resize((256, 256), Image.Resampling.BILINEAR)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize((256, 256)),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    image_tensor = transform(image)
+    return image_tensor.unsqueeze(0), display_image
+
+def predict_mask(model, image_tensor, device='cuda', threshold=0.5):
+    with torch.no_grad():
+        image_tensor = image_tensor.to(device)
+        prediction = model(image_tensor)
+        prediction = (prediction > threshold).float()
+    return prediction
+
+def visualize_result(original_image, predicted_mask):
+    plt.subplot(131)
+    plt.imshow(original_image)
+    plt.title('Original Image')
+    plt.axis('off')
+
+    plt.subplot(132)
+    plt.imshow(predicted_mask.squeeze(), cmap='gray')
+    plt.title('Predicted Mask')
+    plt.axis('off')
+
+    plt.subplot(133)
+    plt.imshow(np.array(original_image))
+    plt.imshow(predicted_mask.squeeze(), cmap='Reds', alpha=0.4)
+    plt.title('Overlay')
+    plt.axis('off')
+
+samp = test_path + '/' + '1203_jpg.rf.be8a48f34842f2c23a84b8b367618dce.jpg'
+image_tensor, original_image = preprocess_image(samp)
+predicted_mask = predict_mask(model, image_tensor, device='cuda')
+predicted_mask = predicted_mask.cpu().numpy()
+visualize_result(original_image, predicted_mask)
