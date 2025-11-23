@@ -5,7 +5,7 @@ from utils.block import DoubleConvBlock, DownsampleBlock, UpsampleBlock
 from data.brain_tumor import train_dataset, valid_dataset, test_dataset
 from utils.trainer import Trainer
 
-batch_size = 4
+batch_size = 1
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
@@ -87,7 +87,8 @@ model_trainer = Trainer(
     test_loader=valid_loader,
     optimizer=optimizer,
     criterion=criterion,
+    checkpoint_path='checkpoints/brain_tumor.pth'
 )
 
-model_trainer.init_tensorboard(log_dir='runs/brain_tumor')
+model_trainer.init_tensorboard(log_dir='runs/brain_tumor').preview_data()
 model_trainer.fit()
