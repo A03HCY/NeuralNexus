@@ -308,7 +308,7 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 class AIMEncoder(nn.Module):
-    def __init__(self, model_dim, head_num, dropout=0.1):
+    def __init__(self, model_dim, head_num, dropout=0.1, max_len=5000):
         super(AIMEncoder, self).__init__()
 
         self.self_attn = MultiHeadAttention(head_num, model_dim)
@@ -323,27 +323,27 @@ class AIMEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, memory, x, mask=None):
-        attn = self.self_attn(memory, memory, memory)
-        attn = self.dropout(attn)
-        memory = self.norm1(memory + attn)
+        _memory = self.norm1(memory)
+        attn = self.self_attn(_memory, _memory, _memory)
+        memory = memory + self.dropout(attn)
 
-        cross_attn = self.cross_attn(memory, x, x, mask=mask)
-        cross_attn = self.dropout(cross_attn)
-        memory = self.norm2(memory + cross_attn)
+        _memory = self.norm2(memory)
+        cross_attn = self.cross_attn(_memory, x, x, mask=mask)
+        memory = memory + self.dropout(cross_attn)
 
-        ffn = self.ffn(memory)
-        ffn = self.dropout(ffn)
-        memory = self.norm3(memory + ffn)
+        _memory = self.norm3(memory)
+        ffn = self.ffn(_memory)
+        memory = memory + self.dropout(ffn)
         return memory
 
 class AIMDecoder(nn.Module):
     def __init__(self, model_dim, head_num, dropout=0.1, max_len=5000):
         super(AIMDecoder, self).__init__()
 
-        self.self_attn = MultiHeadAttention(head_num, model_dim, rope=True, max_len=max_len)
+        self.self_attn = MultiHeadAttention(head_num, model_dim)
         self.norm1 = nn.LayerNorm(model_dim)
 
-        self.cross_attn = MultiHeadAttention(head_num, model_dim, rope=True, max_len=max_len)
+        self.cross_attn = MultiHeadAttention(head_num, model_dim)
         self.norm2 = nn.LayerNorm(model_dim)
 
         self.ffn = ProjectionHead(model_dim, model_dim, as_ffn=True, dropout=dropout)
@@ -352,61 +352,77 @@ class AIMDecoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x, memory, dec_mask=None):
-        attn = self.self_attn(x, x, x, dec_mask)
-        attn = self.dropout(attn)
-        x = self.norm1(x + attn)
+        _x = self.norm1(x)
+        attn = self.self_attn(_x, _x, _x, dec_mask)
+        x = x + self.dropout(attn)
 
-        cross_attn = self.cross_attn(x, memory, memory)
-        cross_attn = self.dropout(cross_attn)
-        x = self.norm2(x + cross_attn)
+        _x = self.norm2(x)
+        cross_attn = self.cross_attn(_x, memory, memory)
+        x = x + self.dropout(cross_attn)
 
-        ffn = self.ffn(x)
-        ffn = self.dropout(ffn)
-        x = self.norm3(x + ffn)
+        _x = self.norm3(x)
+        ffn = self.ffn(_x)
+        x = x + self.dropout(ffn)
         return x
 
 class AIM(nn.Module):
-    def __init__(self, model_dim, vocab_size, head_num, encoder_num=3, decoder_num=3, max_len=5000, dropout=0.1):
+    def __init__(self, model_dim, vocab_size, head_num, mem_dim=512, encoder_num=3, decoder_num=3, max_len=5000, dropout=0.1):
         super(AIM, self).__init__()
-
         self.model_dim = model_dim
         self.vocab_size = vocab_size
-        self.head_num = head_num
-        self.encoder_num = encoder_num
-        self.decoder_num = decoder_num
-        self.max_len = max_len
-
-        self.embedding = nn.Embedding(vocab_size, model_dim)
         
-        self.encoder = nn.ModuleList([AIMEncoder(model_dim, head_num, dropout, max_len) for _ in range(encoder_num)])
-        self.decoder = nn.ModuleList([AIMDecoder(model_dim, head_num, dropout, max_len) for _ in range(decoder_num)])
+        # Embedding 层
+        self.embedding = nn.Embedding(vocab_size, model_dim)
 
+        self.pos_encoding = PositionalEncoding(model_dim, max_len)
+        
+        # AIM Encoder：用于 Memory 读取 Context
+        self.encoder = nn.ModuleList([
+            AIMEncoder(model_dim, head_num, dropout, max_len) 
+            for _ in range(encoder_num)
+        ])
+        self.encoder_norm = nn.LayerNorm(model_dim)
+        # AIM Decoder：用于生成
+        self.decoder = nn.ModuleList([
+            AIMDecoder(model_dim, head_num, dropout, max_len) 
+            for _ in range(decoder_num)
+        ])
+        self.decoder_norm = nn.LayerNorm(model_dim)
         self.projection = ProjectionHead(model_dim, vocab_size)
+        self.init_memory = nn.Parameter(torch.randn(1, mem_dim, model_dim) * 0.02)
 
-        self.memory = torch.zeros(1, max_len, model_dim)
+    def get_init_memory(self, batch_size):
+        return self.init_memory.expand(batch_size, -1, -1)
     
-    def reset_memory(self, batch_size, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        self.memory = torch.zeros(batch_size, self.max_len, self.model_dim).to(device)
-    
-    def encoder_forward(self, x, pad_id=0):
+    def encoder_forward(self, x, memory, detach=True, pad_id=0):
         mask = create_src_mask(x, pad_id)
-        mem = self.memory
+        x = self.embedding(x) * math.sqrt(self.model_dim)
+        x = self.pos_encoding(x)
+        
         for encoder in self.encoder:
-            mem = encoder(mem, x, mask)
-        self.memory = mem
+            memory = encoder(memory, x, mask)
+        
+        memory = self.encoder_norm(memory)
+        
+        if detach:
+            memory = memory.detach()
+        
+        return memory
     
-    def decoder_forward(self, x, pad_id=0):
+    def decoder_forward(self, x, memory, pad_id=0):
         mask = create_tgt_mask(x, pad_id)
+        x = self.embedding(x) * math.sqrt(self.model_dim)
         for decoder in self.decoder:
-            x = decoder(x, self.memory, mask)
+            x = decoder(x, memory, mask)
+        
+        x = self.decoder_norm(x)
         return x
     
-    def forward(self, x):
-        x = self.embedding(x)
-
-        x = self.decoder_forward(x)
+    def forward(self, x, memory=None):
+        if memory is None:
+            memory = self.get_init_memory(x.size(0))
+        x = self.decoder_forward(x, memory)
         x = self.projection(x)
-
         return x
 
 class TransformerEncoder(nn.Module):
