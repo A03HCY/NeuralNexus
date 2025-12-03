@@ -84,18 +84,85 @@ def create_tgt_mask(tgt: torch.Tensor, pad_idx:int=0) -> torch.Tensor:
     mask = pad_mask & lookahead_mask
     return mask
 
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=5000, base=10000):
+        """
+        d_model: 必须是偶数。如果是多头注意力，这里传入的应该是 head_dim。
+        """
+        super(RotaryPositionalEmbedding, self).__init__()
+        
+        # 1. 频率计算 (Inv Freq)
+        # 维度: [d_model / 2]
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_model, 2).float() / d_model))
+        
+        # 2. 生成位置索引 [max_len]
+        t = torch.arange(max_len, dtype=torch.float)
+        
+        # 3. 计算外积得到角度 [max_len, d_model/2]
+        freqs = torch.outer(t, inv_freq)
+        
+        # 4. 拼接频率以匹配 d_model [max_len, d_model]
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # 5. 预计算 Cos 和 Sin [max_len, d_model]
+        self.register_buffer('cos_cached', emb.cos())
+        self.register_buffer('sin_cached', emb.sin())
+
+    def _rotate_half(self, x):
+        """
+        将向量分为两半并旋转: [-x2, x1]
+        无论输入是 3D 还是 4D，Split 都是作用在最后一维 (d_model)
+        """
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        自动适配两种输入:
+        1. [Batch, Seq_Len, Dim]
+        2. [Batch, Head, Seq_Len, Head_Dim]
+        """
+        # 获取输入维度信息
+        ndim = x.ndim
+        seq_len = x.shape[-2] # 无论是 3D(idx 1) 还是 4D(idx 2)，序列长度都在倒数第二维
+        
+        # 6. 切片获取当前长度对应的 cos/sin
+        # [seq_len, d_model]
+        cos = self.cos_cached[:seq_len, :]
+        sin = self.sin_cached[:seq_len, :]
+        
+        # 7. 根据输入维度调整 cos/sin 的形状以支持广播
+        if ndim == 4:
+            # 输入: [B, H, L, D] -> 需要 cos: [1, 1, L, D]
+            cos = cos.view(1, 1, seq_len, -1)
+            sin = sin.view(1, 1, seq_len, -1)
+        elif ndim == 3:
+            # 输入: [B, L, D] -> 需要 cos: [1, L, D]
+            cos = cos.view(1, seq_len, -1)
+            sin = sin.view(1, seq_len, -1)
+        else:
+            raise ValueError(f"不支持的输入维度: {ndim}，仅支持 3D 或 4D 输入")
+
+        # 8. 应用旋转
+        return (x * cos) + (self._rotate_half(x) * sin)
+
 class MultiHeadAttention(nn.Module):
-    def __init__(self, head_num:int, model_dim:int):
+    def __init__(self, head_num: int, model_dim: int, rope: bool = False, max_len: int = 5000):
         super(MultiHeadAttention, self).__init__()
         assert model_dim % head_num == 0
         self.head_num = head_num
         self.model_dim = model_dim
         self.head_dim = model_dim // head_num
+        
         self.W_Q = nn.Linear(model_dim, model_dim)
         self.W_K = nn.Linear(model_dim, model_dim)
         self.W_V = nn.Linear(model_dim, model_dim)
         self.W_O = nn.Linear(model_dim, model_dim)
-    
+        
+        self.use_rope = rope
+        if self.use_rope:
+            self.rope_layer = RotaryPositionalEmbedding(d_model=self.head_dim, max_len=max_len)
+
     def forward(self, Q, K, V, mask=None):
         batch_size = Q.size(0)
         
@@ -104,7 +171,12 @@ class MultiHeadAttention(nn.Module):
         Q = self.W_Q(Q).view(batch_size, -1, self.head_num, self.head_dim).transpose(1, 2)
         K = self.W_K(K).view(batch_size, -1, self.head_num, self.head_dim).transpose(1, 2)
         V = self.W_V(V).view(batch_size, -1, self.head_num, self.head_dim).transpose(1, 2)
-        # 2. 计算 Attention (保持4D形状，利用广播处理Mask)
+        
+        if self.use_rope:
+            Q = self.rope_layer(Q)
+            K = self.rope_layer(K)
+        
+        # 2. 计算 Attention
         output = apply_attention(Q, K, V, mask)
         
         # 3. 合并头
@@ -181,6 +253,160 @@ class PositionwiseFeedForward(nn.Module):
         # 3. 线性投影 2
         # [B, S, 2048] -> [B, S, 512]
         x = self.fc2(x)
+        return x
+
+class ProjectionHead(nn.Module):
+    ''' 通用投影头/前馈网络模块。
+    
+    支持两种模式：
+    1. MLP模式 (use_mlp=True 或 as_ffn=True): Linear -> Act -> Dropout -> Linear
+    2. 线性模式 (use_mlp=False 且 as_ffn=False): Linear
+
+    Args:
+        in_dim (int): 输入特征维度。
+        out_dim (int): 输出特征维度。
+        hidden_dim (int, optional): 隐藏层维度。仅在 MLP 模式下有效。
+            默认为 None。
+            - 如果 as_ffn=True 且 hidden_dim=None，则默认为 in_dim * 4。
+            - 如果 use_mlp=True 且 hidden_dim=None，则默认为 in_dim。
+        dropout (float): Dropout 概率。默认为 0.0。
+        use_mlp (bool): 是否使用 MLP 结构。默认为 False。
+        as_ffn (bool): 是否作为标准 FFN 使用。如果为 True，强制 use_mlp=True 且默认 hidden_dim=in_dim*4。默认为 False。
+    '''
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = None, dropout: float = 0.0, use_mlp: bool = False, as_ffn: bool = False):
+        super(ProjectionHead, self).__init__()
+        
+        if as_ffn:
+            use_mlp = True
+            if hidden_dim is None:
+                hidden_dim = in_dim * 4
+        
+        layers = []
+        
+        if use_mlp:
+            h_dim = hidden_dim if hidden_dim is not None else in_dim
+            
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.GELU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            layers.append(nn.Linear(h_dim, out_dim))
+        else:
+            layers.append(nn.Linear(in_dim, out_dim))
+        
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ''' 前向传播。
+
+        Args:
+            x (torch.Tensor): 输入张量。Shape: [..., in_dim]
+
+        Returns:
+            torch.Tensor: 输出张量。Shape: [..., out_dim]
+        '''
+        return self.net(x)
+
+class AIMEncoder(nn.Module):
+    def __init__(self, model_dim, head_num, dropout=0.1):
+        super(AIMEncoder, self).__init__()
+
+        self.self_attn = MultiHeadAttention(head_num, model_dim)
+        self.norm1 = nn.LayerNorm(model_dim)
+
+        self.cross_attn = MultiHeadAttention(head_num, model_dim)
+        self.norm2 = nn.LayerNorm(model_dim)
+
+        self.ffn = ProjectionHead(model_dim, model_dim, as_ffn=True, dropout=dropout)
+        self.norm3 = nn.LayerNorm(model_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, memory, x, mask=None):
+        attn = self.self_attn(memory, memory, memory)
+        attn = self.dropout(attn)
+        memory = self.norm1(memory + attn)
+
+        cross_attn = self.cross_attn(memory, x, x, mask=mask)
+        cross_attn = self.dropout(cross_attn)
+        memory = self.norm2(memory + cross_attn)
+
+        ffn = self.ffn(memory)
+        ffn = self.dropout(ffn)
+        memory = self.norm3(memory + ffn)
+        return memory
+
+class AIMDecoder(nn.Module):
+    def __init__(self, model_dim, head_num, dropout=0.1, max_len=5000):
+        super(AIMDecoder, self).__init__()
+
+        self.self_attn = MultiHeadAttention(head_num, model_dim, rope=True, max_len=max_len)
+        self.norm1 = nn.LayerNorm(model_dim)
+
+        self.cross_attn = MultiHeadAttention(head_num, model_dim, rope=True, max_len=max_len)
+        self.norm2 = nn.LayerNorm(model_dim)
+
+        self.ffn = ProjectionHead(model_dim, model_dim, as_ffn=True, dropout=dropout)
+        self.norm3 = nn.LayerNorm(model_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, memory, dec_mask=None):
+        attn = self.self_attn(x, x, x, dec_mask)
+        attn = self.dropout(attn)
+        x = self.norm1(x + attn)
+
+        cross_attn = self.cross_attn(x, memory, memory)
+        cross_attn = self.dropout(cross_attn)
+        x = self.norm2(x + cross_attn)
+
+        ffn = self.ffn(x)
+        ffn = self.dropout(ffn)
+        x = self.norm3(x + ffn)
+        return x
+
+class AIM(nn.Module):
+    def __init__(self, model_dim, vocab_size, head_num, encoder_num=3, decoder_num=3, max_len=5000, dropout=0.1):
+        super(AIM, self).__init__()
+
+        self.model_dim = model_dim
+        self.vocab_size = vocab_size
+        self.head_num = head_num
+        self.encoder_num = encoder_num
+        self.decoder_num = decoder_num
+        self.max_len = max_len
+
+        self.embedding = nn.Embedding(vocab_size, model_dim)
+        
+        self.encoder = nn.ModuleList([AIMEncoder(model_dim, head_num, dropout, max_len) for _ in range(encoder_num)])
+        self.decoder = nn.ModuleList([AIMDecoder(model_dim, head_num, dropout, max_len) for _ in range(decoder_num)])
+
+        self.projection = ProjectionHead(model_dim, vocab_size)
+
+        self.memory = torch.zeros(1, max_len, model_dim)
+    
+    def reset_memory(self, batch_size, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.memory = torch.zeros(batch_size, self.max_len, self.model_dim).to(device)
+    
+    def encoder_forward(self, x, pad_id=0):
+        mask = create_src_mask(x, pad_id)
+        mem = self.memory
+        for encoder in self.encoder:
+            mem = encoder(mem, x, mask)
+        self.memory = mem
+    
+    def decoder_forward(self, x, pad_id=0):
+        mask = create_tgt_mask(x, pad_id)
+        for decoder in self.decoder:
+            x = decoder(x, self.memory, mask)
+        return x
+    
+    def forward(self, x):
+        x = self.embedding(x)
+
+        x = self.decoder_forward(x)
+        x = self.projection(x)
+
         return x
 
 class TransformerEncoder(nn.Module):
